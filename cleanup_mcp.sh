@@ -5,52 +5,50 @@ echo "======================================"
 echo " Linux Operations MCP cleanup start"
 echo "======================================"
 
-MCP_DIR="/home/ubuntu/mcp"
 SERVICE_FILE="/etc/systemd/system/mcp.service"
+ENV_FILE="/etc/mcp.env"
+MCP_DIR="/home/ubuntu/mcp"
 
 ########################################
-# 1️⃣ MCP 서비스 중지 및 비활성화
+# 1️⃣ MCP 서비스 중지 및 제거
 ########################################
-echo "[1/4] Stopping MCP service..."
+echo "[1/5] Stopping and disabling MCP service..."
 
-if systemctl list-unit-files | grep -q "^mcp.service"; then
-  sudo systemctl stop mcp || true
-  sudo systemctl disable mcp || true
-else
-  echo "  - MCP service not found"
-fi
+sudo systemctl stop mcp 2>/dev/null || true
+sudo systemctl disable mcp 2>/dev/null || true
 
 ########################################
-# 2️⃣ systemd 서비스 파일 제거
+# 2️⃣ systemd 파일 제거
 ########################################
-echo "[2/4] Removing systemd service file..."
+echo "[2/5] Removing systemd service..."
 
-if [ -f "$SERVICE_FILE" ]; then
-  sudo rm -f "$SERVICE_FILE"
-  sudo systemctl daemon-reload
-  echo "  - Service file removed"
-else
-  echo "  - Service file already removed"
-fi
+sudo rm -f "$SERVICE_FILE"
+sudo systemctl daemon-reload
 
 ########################################
-# 3️⃣ MCP 디렉터리 제거
+# 3️⃣ 환경변수 파일 제거
 ########################################
-echo "[3/4] Removing MCP directory..."
+echo "[3/5] Removing LLM API environment file..."
 
-if [ -d "$MCP_DIR" ]; then
-  sudo rm -rf "$MCP_DIR"
-  echo "  - $MCP_DIR removed"
-else
-  echo "  - MCP directory already removed"
-fi
+sudo rm -f "$ENV_FILE"
 
 ########################################
-# 4️⃣ 완료
+# 4️⃣ MCP 디렉터리 정리 여부 안내
 ########################################
-echo "[4/4] Cleanup completed"
+echo "[4/5] MCP directory cleanup (manual)"
+
+echo "⚠ MCP directory not removed automatically:"
+echo "  $MCP_DIR"
+echo "If you want full removal, run:"
+echo "  sudo rm -rf $MCP_DIR"
+
+########################################
+# 5️⃣ 완료
+########################################
+echo "[5/5] Cleanup completed."
 
 echo ""
 echo "======================================"
-echo " MCP cleanup finished successfully"
+echo " MCP cleanup completed"
 echo "======================================"
+echo ""
