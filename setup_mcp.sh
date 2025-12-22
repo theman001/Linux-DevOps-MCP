@@ -8,25 +8,35 @@ echo "======================================"
 MCP_DIR="/home/ubuntu/mcp"
 VENV_DIR="$MCP_DIR/mcp-venv"
 SERVICE_FILE="/etc/systemd/system/mcp.service"
+ENV_FILE="/etc/mcp.env"
 
 ########################################
-# 0️⃣ LLM API Key 입력
+# 1️⃣ LLM API KEY 입력
 ########################################
-read -s -p "Enter Ollama Cloud API Key: " LLM_API
+read -s -p "Enter Ollama Cloud LLM_API Key: " LLM_API
 echo ""
-
 if [ -z "$LLM_API" ]; then
-  echo "ERROR: LLM_API key is empty"
+  echo "ERROR: LLM_API cannot be empty"
   exit 1
 fi
 
-# 현재 쉘에서도 사용 가능하게 export
+########################################
+# 2️⃣ Environment 파일 생성
+########################################
+echo "[1/7] Writing environment file..."
+
+sudo tee "$ENV_FILE" > /dev/null <<EOF
+LLM_API=$LLM_API
+EOF
+sudo chmod 600 "$ENV_FILE"
+
+# 현재 셸에서도 사용 가능하도록 export
 export LLM_API="$LLM_API"
 
 ########################################
-# 1️⃣ 기본 패키지 확인 (없을 때만 설치)
+# 3️⃣ 기본 패키지 확인
 ########################################
-echo "[1/6] Checking system packages..."
+echo "[2/7] Checking system packages..."
 
 NEED_INSTALL=0
 MISSING_PKGS=()
@@ -48,14 +58,14 @@ if [ "$NEED_INSTALL" -eq 1 ]; then
 fi
 
 ########################################
-# 2️⃣ MCP 전용 가상환경
+# 4️⃣ MCP 가상환경
 ########################################
-echo "[2/6] Setting virtual environment..."
+echo "[3/7] Creating virtual environment..."
 
 cd "$MCP_DIR"
 
 if [ ! -d "$VENV_DIR" ]; then
-  python3 -m venv "$VENV_DIR"
+  python3 -m venv mcp-venv
 fi
 
 source "$VENV_DIR/bin/activate"
@@ -64,9 +74,9 @@ pip install mcp requests
 deactivate
 
 ########################################
-# 3️⃣ systemd 서비스 생성 (Environment 포함)
+# 5️⃣ systemd 서비스 생성
 ########################################
-echo "[3/6] Creating systemd service..."
+echo "[4/7] Creating systemd service..."
 
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
@@ -79,8 +89,7 @@ User=root
 WorkingDirectory=$MCP_DIR
 ExecStart=$VENV_DIR/bin/python $MCP_DIR/mcp_server.py
 
-# 🔑 LLM API Key
-Environment=LLM_API=$LLM_API
+EnvironmentFile=$ENV_FILE
 
 Restart=always
 RestartSec=3
@@ -94,36 +103,22 @@ WantedBy=multi-user.target
 EOF
 
 ########################################
-# 4️⃣ systemd 반영
+# 6️⃣ 서비스 반영
 ########################################
-echo "[4/6] Enabling MCP service..."
+echo "[5/7] Enabling MCP service..."
 
 sudo systemctl daemon-reload
 sudo systemctl enable mcp
 sudo systemctl restart mcp
 
 ########################################
-# 5️⃣ Swap 확인
+# 7️⃣ 확인
 ########################################
-echo "[5/6] Checking swap..."
+echo "[6/7] Verifying environment injection..."
 
-if ! swapon --show | grep -q "/swapfile"; then
-  sudo fallocate -l 4G /swapfile
-  sudo chmod 600 /swapfile
-  sudo mkswap /swapfile
-  sudo swapon /swapfile
+systemctl show mcp --property=Environment
 
-  if ! grep -q "^/swapfile" /etc/fstab; then
-    echo "/swapfile swap swap defaults 0 0" | sudo tee -a /etc/fstab
-  fi
-fi
-
-########################################
-# 6️⃣ 상태 확인
-########################################
-echo "[6/6] MCP status:"
-systemctl status mcp --no-pager || true
-
+echo ""
 echo "======================================"
 echo " MCP setup completed successfully"
 echo "======================================"
