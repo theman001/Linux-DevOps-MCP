@@ -72,15 +72,15 @@ MCP 서버는 프로젝트 디렉터리와 **물리적으로 분리**되어 있�
 
 ```
 /home/ubuntu/mcp/
-├─ mcp_server.py
-├─ utils.py
-├─ healthcheck.py
-├─ idle_watcher.py
-├─ boot_check.py
-├─ state.json
-├─ incidents.json
-├─ patterns.json
-├─ error.log
+├─ mcp_server.py          # MCP 메인 서버
+├─ utils.py               # 공통 예외처리 / 유틸
+├─ healthcheck.py         # MCP self-health 체크
+├─ idle_watcher.py        # 장시간 미사용 시 휴면
+├─ boot_check.py          # 재부팅 후 패턴 기반 점검
+├─ state.json             # MCP 상태 (자동 생성)
+├─ incidents.json         # 장애 이력 (자동 생성)
+├─ patterns.json          # 장애 패턴 (자동 생성)
+├─ error.log              # 예외 로그 (자동 생성)
 ├─ README.md
 └─ mcp-venv/
 ```
