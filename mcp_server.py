@@ -5,36 +5,36 @@ import time
 import threading
 import traceback
 import subprocess
+import argparse
 from pathlib import Path
 from datetime import datetime
 
 from ollama import Client
 
+# =========================
 # 설정
+# =========================
 MCP_DIR = Path("/home/ubuntu/mcp")
 LOG_FILE = MCP_DIR / "error.log"
 STATE_FILE = MCP_DIR / "state.json"
 
-# Ollama Cloud 설정
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
-# Cloud 모델명 (필요시 'gpt-oss:120b-cloud' 등으로 변경 가능)
 OLLAMA_MODEL = "gpt-oss:120b"
 
+# =========================
+# 공통 유틸
+# =========================
 def log_error(msg):
     with open(LOG_FILE, "a") as f:
         f.write(f"[{datetime.now()}] {msg}\n")
 
 def update_heartbeat():
-    """
-    백그라운드에서 state.json의 타임스탬프를 갱신
-    (healthcheck.py가 죽은 프로세스로 오인하지 않게 함)
-    """
     while True:
         try:
             state = {"last_heartbeat": time.time(), "status": "running"}
             STATE_FILE.write_text(json.dumps(state))
         except Exception:
-            pass  # 하트비트 실패는 로그 남기지 않음 (IO 부하 방지)
+            pass
         time.sleep(10)
 
 def rule_based_fallback(prompt: str, reason: str) -> dict:
@@ -45,6 +45,9 @@ def rule_based_fallback(prompt: str, reason: str) -> dict:
         "notes": prompt[:200]
     }
 
+# =========================
+# MCP Server Core
+# =========================
 def call_llm(prompt: str) -> dict:
     if not OLLAMA_API_KEY:
         raise RuntimeError("OLLAMA_API_KEY not set")
@@ -62,81 +65,131 @@ Respond ONLY in valid JSON with this schema:
   "reason": "string",
   "actions": [
     {
-      "type": "shell | edit_file",
-      "command": "string",
-      "file": "string",
-      "diff": "string"
+      "type": "shell",
+      "command": "string"
     }
   ]
 }
 """
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
 
     try:
-        # format='json'을 사용하여 구조화된 데이터 강제
         response = client.chat(
             model=OLLAMA_MODEL,
             messages=messages,
-            stream=False, # 단순화를 위해 stream 끔 (JSON 파싱 안정성)
-            format='json'
+            stream=False,
+            format="json"
         )
-        content = response['message']['content']
-        return json.loads(content)
+        return json.loads(response["message"]["content"])
 
-    except json.JSONDecodeError:
-        log_error(f"JSON Parse Error. Raw content: {content}")
+    except json.JSONDecodeError as e:
+        log_error(f"JSON Parse Error: {e}")
         return rule_based_fallback(prompt, "Invalid JSON from LLM")
     except Exception as e:
-        log_error(f"LLM Call Error: {repr(e)}\n{traceback.format_exc()}")
+        log_error(f"LLM Error: {e}\n{traceback.format_exc()}")
         return rule_based_fallback(prompt, "LLM API Error")
 
 def apply_actions(actions: list):
     results = []
     for action in actions:
         try:
-            if action["type"] == "shell":
+            if action.get("type") == "shell":
                 proc = subprocess.run(
-                    action["command"], shell=True, capture_output=True, text=True, timeout=30
+                    action["command"],
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30
                 )
-                results.append(f"CMD: {action['command']} -> {proc.returncode}")
-            elif action["type"] == "edit_file":
-                with open(action["file"], "a") as f:
-                    f.write(f"\n# MCP AUTO PATCH ({datetime.now()})\n")
-                    f.write(action.get("diff", ""))
-                results.append(f"EDIT: {action['file']}")
+                results.append(f"{action['command']} -> rc={proc.returncode}")
         except Exception as e:
             log_error(f"Action Fail: {action} -> {e}")
+            results.append(f"ERROR: {e}")
     return results
 
 def handle_event(prompt: str):
     result = call_llm(prompt)
-    
     if result.get("decision") == "APPLY_FIX":
-        logs = apply_actions(result.get("actions", []))
-        result["action_logs"] = logs
-        
+        result["action_logs"] = apply_actions(result.get("actions", []))
     return result
 
-if __name__ == "__main__":
-    # 1. 하트비트 스레드 시작 (데몬)
+# =========================
+# MCP Client (CLI Mode)
+# =========================
+def run_cli_mode():
+    print("===================================")
+    print(" MCP CLI MODE (type 'quit' to exit)")
+    print("===================================")
+
+    busy = False
+    lock = threading.Lock()
+
+    while True:
+        try:
+            user_input = input("\n[MCP INPUT] > ").strip()
+
+            if user_input.lower() == "quit":
+                print("\n[MCP] CLI mode exited.")
+                break
+
+            with lock:
+                if busy:
+                    print("⚠️  MCP is processing a request. Input ignored.")
+                    continue
+                busy = True
+
+            print("[MCP] Processing...")
+
+            result = handle_event(user_input)
+
+            print("\n[MCP OUTPUT]")
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+
+        except Exception as e:
+            log_error(f"CLI Error: {e}")
+            print("❌ Error occurred. See error.log")
+
+        finally:
+            with lock:
+                busy = False
+
+# =========================
+# Main Entry
+# =========================
+def main():
+    parser = argparse.ArgumentParser(description="Linux Operations MCP")
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Run MCP in interactive CLI mode"
+    )
+    args = parser.parse_args()
+
+    # 하트비트 스레드
     t = threading.Thread(target=update_heartbeat, daemon=True)
     t.start()
 
-    # 2. 메인 루프 (stdio)
+    if args.cli:
+        run_cli_mode()
+        return
+
+    # 기본 STDIO Server 모드
     while True:
         try:
             user_input = input()
             if not user_input:
                 continue
-            
             output = handle_event(user_input)
             print(json.dumps(output))
-            
         except EOFError:
             break
         except Exception as e:
             log_error(f"Main Loop Error: {e}")
             print(json.dumps(rule_based_fallback("Unknown", "System Error")))
+
+if __name__ == "__main__":
+    main()
