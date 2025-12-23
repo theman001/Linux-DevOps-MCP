@@ -1,117 +1,154 @@
 #!/usr/bin/env python3
 import os
 import json
-import time
+import subprocess
 import traceback
-import requests
 from datetime import datetime
+from typing import Dict, Any
+
+from ollama import Client
 
 MCP_DIR = "/home/ubuntu/mcp"
-LOG_FILE = f"{MCP_DIR}/error.log"
+ERROR_LOG = f"{MCP_DIR}/error.log"
+INCIDENTS = f"{MCP_DIR}/incidents.json"
 
-LLM_API = os.environ.get("LLM_API")  # ← 반드시 이 변수명 사용
-OLLAMA_ENDPOINT = "https://ollama.com/api/chat"
-MODEL_NAME = "gpt-oss:120b"
+OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
+OLLAMA_MODEL = "gpt-oss:120b"
 
-def log_error(e: Exception):
-    with open(LOG_FILE, "a") as f:
-        f.write(f"[{datetime.now()}] {repr(e)}\n")
+# -----------------------------
+# Logging helpers
+# -----------------------------
+def log_error(err: Exception):
+    with open(ERROR_LOG, "a") as f:
+        f.write(f"[{datetime.now()}] {repr(err)}\n")
         f.write(traceback.format_exc())
         f.write("\n")
 
-def call_llm(prompt: str) -> dict:
-    if not LLM_API:
-        raise RuntimeError("LLM_API environment variable not set")
+def record_incident(reason: str):
+    data = []
+    if os.path.exists(INCIDENTS):
+        try:
+            data = json.load(open(INCIDENTS))
+        except Exception:
+            pass
 
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
+    data.append({
+        "time": datetime.now().isoformat(),
+        "reason": reason
+    })
+
+    with open(INCIDENTS, "w") as f:
+        json.dump(data, f, indent=2)
+
+# -----------------------------
+# LLM Call (Ollama Cloud)
+# -----------------------------
+def call_llm(prompt: str) -> Dict[str, Any]:
+    if not OLLAMA_API_KEY:
+        raise RuntimeError("OLLAMA_API_KEY not set")
+
+    client = Client(
+        host="https://ollama.com",
+        headers={
+            "Authorization": f"Bearer {OLLAMA_API_KEY}"
+        }
+    )
+
+    response = client.chat(
+        model=OLLAMA_MODEL,
+        messages=[
             {
                 "role": "system",
                 "content": (
-                    "You are a Linux operations AI.\n"
-                    "Always respond in strict JSON format.\n"
+                    "You are a Linux operations AI. "
+                    "Respond ONLY in valid JSON.\n\n"
                     "Schema:\n"
-                    "{"
-                    "  action: one of [noop, shell, edit_file],"
-                    "  reason: string,"
-                    "  command?: string,"
-                    "  file?: string,"
-                    "  diff?: string"
+                    "{\n"
+                    "  \"decision\": \"auto_fix | advise | noop\",\n"
+                    "  \"actions\": [\"shell commands\"],\n"
+                    "  \"summary\": \"human readable summary\"\n"
                     "}"
-                ),
+                )
             },
-            {"role": "user", "content": prompt},
+            {
+                "role": "user",
+                "content": prompt
+            }
         ],
-        "stream": False,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {LLM_API}",
-        "Content-Type": "application/json",
-    }
-
-    resp = requests.post(
-        OLLAMA_ENDPOINT,
-        headers=headers,
-        json=payload,
-        timeout=30,
+        stream=False
     )
-    resp.raise_for_status()
 
-    data = resp.json()
-    content = data["message"]["content"]
+    content = response["message"]["content"]
     return json.loads(content)
 
-def rule_based_fallback(prompt: str) -> dict:
+# -----------------------------
+# Rule-based fallback
+# -----------------------------
+def fallback_decision(prompt: str) -> Dict[str, Any]:
     if "disk" in prompt.lower():
         return {
-            "action": "shell",
-            "reason": "Rule-based disk check fallback",
-            "command": "df -h",
+            "decision": "advise",
+            "actions": ["df -h", "du -sh /var/log/*"],
+            "summary": "Disk-related issue detected. Manual inspection recommended."
+        }
+
+    if "memory" in prompt.lower():
+        return {
+            "decision": "auto_fix",
+            "actions": ["free -m", "sync; echo 3 > /proc/sys/vm/drop_caches"],
+            "summary": "Memory pressure detected. Dropping caches."
         }
 
     return {
-        "action": "noop",
-        "reason": "Fallback: no safe automatic action",
+        "decision": "noop",
+        "actions": [],
+        "summary": "No actionable issue detected."
     }
 
-def apply_action(result: dict):
-    action = result.get("action")
+# -----------------------------
+# Action executor
+# -----------------------------
+def execute_actions(actions):
+    results = []
+    for cmd in actions:
+        try:
+            out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, timeout=30)
+            results.append(out.decode())
+        except Exception as e:
+            log_error(e)
+            results.append(str(e))
+    return results
 
-    if action == "shell":
-        cmd = result.get("command")
-        if cmd:
-            os.system(cmd)
+# -----------------------------
+# MCP Entry Point
+# -----------------------------
+def handle_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = event.get("prompt", "")
 
-    elif action == "edit_file":
-        path = result.get("file")
-        diff = result.get("diff")
-        if path and diff:
-            with open(path, "a") as f:
-                f.write("\n# MCP AUTO PATCH\n")
-                f.write(diff)
-
-def handle_event(prompt: str):
     try:
         llm_result = call_llm(prompt)
     except Exception as e:
         log_error(e)
-        llm_result = rule_based_fallback(prompt)
+        record_incident("LLM failure → fallback used")
+        llm_result = fallback_decision(prompt)
 
-    apply_action(llm_result)
+    if llm_result["decision"] == "auto_fix":
+        outputs = execute_actions(llm_result["actions"])
+        llm_result["outputs"] = outputs
 
-def main():
+    return llm_result
+
+# -----------------------------
+# Main loop (stdin/stdout MCP)
+# -----------------------------
+if __name__ == "__main__":
     while True:
         try:
-            prompt = input().strip()
-            if prompt:
-                handle_event(prompt)
+            raw = input()
+            event = json.loads(raw)
+            result = handle_event(event)
+            print(json.dumps(result), flush=True)
         except EOFError:
-            time.sleep(1)
+            break
         except Exception as e:
             log_error(e)
-            time.sleep(5)
-
-if __name__ == "__main__":
-    main()
