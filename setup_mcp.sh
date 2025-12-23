@@ -5,6 +5,7 @@ MCP_DIR="/home/ubuntu/mcp"
 VENV_DIR="$MCP_DIR/mcp-venv"
 ENV_FILE="/etc/mcp.env"
 SERVICE_FILE="/etc/systemd/system/mcp.service"
+REQ_FILE="$MCP_DIR/requirements.txt"
 
 echo "======================================"
 echo " Linux Operations MCP Setup"
@@ -28,31 +29,53 @@ fi
 # 2️⃣ 환경변수 파일 생성
 ########################################
 echo "[Step 1] Creating environment file..."
+sudo mkdir -p "$(dirname "$ENV_FILE")"
 sudo tee "$ENV_FILE" > /dev/null <<EOF
 OLLAMA_API_KEY=$OLLAMA_API_KEY
 EOF
 sudo chmod 600 "$ENV_FILE"
 
 ########################################
-# 3️⃣ Python venv 및 라이브러리 설치
+# 3️⃣ MCP 디렉토리 & requirements.txt 확인
 ########################################
-echo "[Step 2] Setting up Python environment..."
-mkdir -p "$MCP_DIR"
-cd "$MCP_DIR"
+echo "[Step 2] Preparing MCP directory..."
 
-if [ ! -d "$VENV_DIR" ]; then
-    python3 -m venv "$VENV_DIR"
+mkdir -p "$MCP_DIR"
+
+if [ ! -f "$REQ_FILE" ]; then
+  echo " - requirements.txt not found. Creating default one."
+  cat > "$REQ_FILE" <<EOF
+ollama
+EOF
+else
+  echo " - requirements.txt found."
 fi
 
-source "$VENV_DIR/bin/activate"
-pip install --upgrade pip > /dev/null
-pip install ollama > /dev/null
-deactivate
+########################################
+# 4️⃣ MCP 전용 Python venv 생성
+########################################
+echo "[Step 3] Setting up MCP Python virtual environment..."
+
+if [ ! -d "$VENV_DIR" ]; then
+    echo " - Creating venv at $VENV_DIR"
+    python3 -m venv "$VENV_DIR"
+else
+    echo " - Existing venv found at $VENV_DIR"
+fi
 
 ########################################
-# 4️⃣ systemd 서비스 등록
+# 5️⃣ MCP 의존성 즉시 설치 (requirements.txt)
 ########################################
-echo "[Step 3] Registering systemd service..."
+echo "[Step 4] Installing Python dependencies into MCP venv..."
+
+"$VENV_DIR/bin/python" -m pip install --upgrade pip > /dev/null
+"$VENV_DIR/bin/python" -m pip install -r "$REQ_FILE" > /dev/null
+
+########################################
+# 6️⃣ systemd 서비스 등록
+########################################
+echo "[Step 5] Registering systemd service..."
+
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
 Description=Linux Operations MCP
@@ -73,36 +96,37 @@ WantedBy=multi-user.target
 EOF
 
 ########################################
-# 5️⃣ 서비스 활성화
+# 7️⃣ 서비스 활성화
 ########################################
-echo "[Step 4] Starting service..."
+echo "[Step 6] Starting service..."
+
 sudo systemctl daemon-reload
 sudo systemctl enable mcp
 sudo systemctl restart mcp
 
 ########################################
-# 6️⃣ ☁️ Ollama Cloud 연결 검증 (피드백)
+# 8️⃣ ☁️ Ollama Cloud 연결 검증
 ########################################
 echo "======================================"
 echo " 🔍 Verifying Ollama Cloud Connection..."
 echo "======================================"
 
-# 검증용 임시 파이썬 스크립트 실행
-VERIFY_RESULT=$(source "$VENV_DIR/bin/activate" && python3 -c "
-import os, sys
+VERIFY_RESULT=$(
+"$VENV_DIR/bin/python" - <<'PYCODE'
+import os
 from ollama import Client
+
 try:
     client = Client(
-        host='https://ollama.com',
-        headers={'Authorization': 'Bearer ' + os.environ['OLLAMA_API_KEY']}
+        host="https://ollama.com",
+        headers={"Authorization": "Bearer " + os.environ["OLLAMA_API_KEY"]}
     )
-    # 가벼운 모델 정보 조회 시도 (실제 호출 대신 list 확인)
-    # API 키가 유효한지 확인하는 가장 가벼운 방법
-    client.list() 
-    print('SUCCESS')
+    client.list()
+    print("SUCCESS")
 except Exception as e:
-    print(f'FAIL: {e}')
-" 2>&1)
+    print(f"FAIL: {e}")
+PYCODE
+)
 
 if [[ "$VERIFY_RESULT" == *"SUCCESS"* ]]; then
     echo "✅ [SUCCESS] Ollama Cloud connected successfully!"
