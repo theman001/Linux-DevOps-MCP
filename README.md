@@ -21,21 +21,43 @@ OCI Always Free 환경에 최적화된 **자율 운영 및 장애 학습형** MC
 MCP 서버는 프로젝트 작업 경로와 물리적으로 분리되어 관리됩니다.
 ```text
 /home/ubuntu/mcp/
-├─ mcp_server.py          # MCP 메인 서버 (중앙 관제)
-├─ utils.py               # 공통 예외처리 및 유틸리티
-├─ healthcheck.py         # MCP self-health 체크 로직
-├─ idle_watcher.py        # 리소스 절약을 위한 휴면 관리
-├─ boot_check.py          # 재부팅 후 패턴 기반 점검
-├─ state.json             # MCP 서버 현재 상태 데이터
-├─ incidents.json         # 발생한 장애 이력 기록
-├─ patterns.json          # 학습된 장애 해결 패턴
-├─ error.log              # 실시간 예외 발생 로그
-├─ setup_mcp.sh           # 서버 설치 및 가상환경 구축
-├─ update_mcp.sh          # 최신 코드 업데이트 스크립트
-├─ healthcheck_all.sh     # 전체 시스템 상태 점검
-├─ cleanup_mcp.sh         # 서비스 중지 및 완전 제거
-└─ mcp-venv/              # MCP 전용 독립 가상환경
+├─ mcp_server.py          # MCP 메인 서버: 도구 호출 및 중앙 제어 로직 수행
+├─ utils.py               # 공통 유틸리티: 전역 예외 처리 및 로깅 함수 정의
+├─ healthcheck.py         # MCP 자가 점검: 서버 프로세스 생존 확인 및 하트비트 전송
+├─ idle_watcher.py        # 리소스 감시: CPU/메모리 부하 및 미사용 시간 기반 휴면 관리
+├─ boot_check.py          # 선제적 점검: 재부팅 직후 과거 장애 패턴 기반 시스템 체크
+├─ healthcheck_all.sh     # 전체 점검 스크립트: MCP 및 시스템 전체 상태 통합 확인
+├─ ollama_check.sh        # Ollama 점검: 로컬/클라우드 Ollama API 가동 상태 확인
+├─ setup_mcp.sh           # 설치 스크립트: 가상환경 생성 및 systemd 서비스 자동 등록
+├─ update_mcp.sh          # 업데이트 스크립트: 최신 코드 동기화 및 서비스 재구동
+├─ cleanup_mcp.sh         # 제거 스크립트: 서비스 해제 및 관련 파일 완전 삭제
+├─ requirements.txt       # 의존성 관리: 프로젝트 실행에 필요한 파이썬 패키지 목록
+├─ state.json             # 상태 데이터: MCP 서버의 현재 런타임 상태 저장
+├─ incidents.json         # 장애 이력: 발생한 시스템 문제 및 에러 정보 기록
+├─ patterns.json          # 학습 데이터: 반복되는 장애에 대한 해결 패턴 데이터베이스
+└─ error.log              # 에러 로그: 런타임 중 발생하는 상세 예외 로그 저장
 ```
+---
+
+## 🔍 주요 파일별 상세 로직 설명
+
+### 1. idle_watcher.py (리소스 감시 및 휴면)
+- **부하 측정:** `psutil` 라이브러리를 통해 시스템 전체의 CPU 사용률과 메모리 점유율을 주기적으로 모니터링합니다.
+- **유휴 상태 판단:** 설정된 임계치 이하로 리소스 사용량이 유지되는 시간을 측정합니다. 
+- **휴면 제어:** 장시간(예: 30분 이상) 인터랙션이 없고 리소스 사용이 낮을 경우, MCP 서버를 대기 모드로 전환하거나 알림을 생성하여 OCI 자원을 보존합니다.
+
+### 2. boot_check.py (재부팅 후 패턴 점검)
+- **이력 분석:** 서버 부팅 직후 `patterns.json`과 `incidents.json`을 분석하여 빈번하게 발생했던 장애 요소를 식별합니다.
+- **선제 검사:** 단순히 서비스가 켜졌는지 확인하는 것을 넘어, 과거에 문제를 일으켰던 특정 로그 패턴이나 설정 파일을 우선적으로 검사하여 장애 발생 가능성을 사전에 차단합니다.
+
+### 3. mcp_server.py (중앙 제어 및 도구 통합)
+- **도구 호출:** 리눅스 시스템 명령어 실행, 파일 읽기/쓰기 등의 도구를 GPT가 사용할 수 있도록 인터페이스를 제공합니다.
+- **컨텍스트 주입:** 명령 수행 전 `state.json`의 정보를 모델에게 전달하여, 현재 서버 상태를 인지한 상태에서 운영 판단을 내릴 수 있게 합니다.
+
+### 4. healthcheck.py & healthcheck_all.sh (안정성 보장)
+- **프로세스 모니터링:** MCP 서버가 응답하지 않거나 좀비 프로세스가 된 경우 이를 감지합니다.
+- **자동 복구:** `healthcheck_all.sh`와 연동되어 서비스가 비정상적일 경우 `systemctl restart`를 호출하여 무중단 운영을 시도합니다.
+
 ---
 
 ## 🌟 핵심 기능
