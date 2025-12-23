@@ -157,10 +157,34 @@ def run_cli_mode():
             with lock:
                 busy = False
 
+
+# =========================
+# env(api_key) load
+# =========================
+
+def ensure_env_loaded():
+    if os.getenv("OLLAMA_API_KEY"):
+        return
+
+    env_file = "/etc/mcp.env"
+    if not os.path.exists(env_file):
+        return
+
+    try:
+        with open(env_file) as f:
+            for line in f:
+                if line.strip() and not line.startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    os.environ.setdefault(k, v)
+    except Exception as e:
+        log_error(f"Failed to load env file: {e}")
+
+
 # =========================
 # Main Entry
 # =========================
 def main():
+    ensure_env_loaded()
     parser = argparse.ArgumentParser(description="Linux Operations MCP")
     parser.add_argument(
         "--cli",
