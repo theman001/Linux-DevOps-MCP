@@ -20,21 +20,33 @@ STATE_FILE = MCP_DIR / "state.json"
 ENV_FILE = "/etc/mcp.env"
 
 ########################################
-# 모델 정책 (확정)
+# 모델 정책
 ########################################
 MODEL_CLASSIFIER = "nemotron-3-nano:30b-cloud"
 
-MODEL_ROUTING = {
-    "server_operation": "gpt-oss:120b",
-    "code_generation": "devstral-2:123b-cloud",
-    "explanatory": "gemini-3-flash-preview:cloud",
-    "unknown": "ministral-3:14b",
+MODEL_CHAINS = {
+    "server_operation": [
+        "gpt-oss:120b",
+        "qwen3-next:80b",
+    ],
+    "code_generation": [
+        "devstral-2:123b-cloud",
+        "qwen3-coder:30b-cloud",
+    ],
+    "explanatory": [
+        "gemini-3-flash-preview:cloud",
+        "mistral-large-3",
+    ],
+    "unknown": [
+        "ministral-3:14b",
+        "glm-4.6",
+    ],
 }
 
 CONFIDENCE_THRESHOLD = 0.6
 
 ########################################
-# report mode 판단 (룰 기반 ONLY)
+# report mode 판단
 ########################################
 REPORT_KEYWORDS = [
     "report mode",
@@ -44,7 +56,7 @@ REPORT_KEYWORDS = [
 ]
 
 ########################################
-# 캐시 (토큰 절약)
+# 캐시
 ########################################
 CLASSIFY_CACHE: dict[str, dict] = {}
 
@@ -57,8 +69,7 @@ def log_error(msg: str):
         f.write(f"[{datetime.now()}] {msg}\n")
 
 def progress(msg: str):
-    """중간 단계 피드백 (stderr 전용)"""
-    print(f"⏳ {msg}", file=sys.stderr, flush=True)
+    print(msg, file=sys.stderr, flush=True)
 
 ########################################
 # ENV 로딩
@@ -107,26 +118,17 @@ def is_report_mode(user_input: str) -> bool:
     return any(k in t for k in REPORT_KEYWORDS)
 
 ########################################
-# 1차 분류 (nemotron)
+# 1차 분류
 ########################################
 def classify_request(user_input: str) -> dict:
     if user_input in CLASSIFY_CACHE:
         return CLASSIFY_CACHE[user_input]
 
     system_prompt = """
-You are an intent classification and request rewriting engine.
-
-Rules:
-- Output ONLY valid JSON
-- Do NOT generate commands
-- Do NOT decide execution or report mode
-- Be concise
-
+Return ONLY valid JSON.
+Do not generate commands.
 Nature values:
-- server_operation
-- code_generation
-- explanatory
-- unknown
+server_operation | code_generation | explanatory | unknown
 """
 
     user_prompt = f"""
@@ -135,17 +137,14 @@ User request:
 
 Return JSON:
 {{
-  "nature": "server_operation | code_generation | explanatory | unknown",
-  "intent": "string",
+  "nature": "string",
   "rewritten_request": "string",
-  "key_requirements": ["string"],
-  "output_expectation": "string",
   "confidence": 0.0
 }}
 """
 
     try:
-        progress("요청 분류 중 (nemotron-3-nano)")
+        progress("⏳ 요청 분류 중 (nemotron-3-nano)")
         client = ollama_client()
         resp = client.chat(
             model=MODEL_CLASSIFIER,
@@ -158,31 +157,48 @@ Return JSON:
         )
         result = json.loads(resp["message"]["content"])
         CLASSIFY_CACHE[user_input] = result
-        progress(
-            f"분류 완료: nature={result.get('nature')} "
-            f"(confidence={result.get('confidence', 0):.2f})"
-        )
         return result
     except Exception as e:
-        log_error(f"classify error: {e}")
+        log_error(traceback.format_exc())
         return {
             "nature": "unknown",
-            "intent": "classification_failed",
             "rewritten_request": user_input,
-            "key_requirements": [],
-            "output_expectation": "",
             "confidence": 0.0
         }
 
 ########################################
+# LLM 호출 (자동 스위칭)
+########################################
+def call_with_fallback(models: list[str], system_prompt: str, user_prompt: str) -> dict:
+    last_error = None
+    client = ollama_client()
+
+    for model in models:
+        try:
+            progress(f"## {model} 에 요청")
+            resp = client.chat(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                format="json",
+                stream=False
+            )
+            return json.loads(resp["message"]["content"])
+        except Exception as e:
+            last_error = str(e)
+            progress(f"@@ {model} 에 요청 실패 (실패 사유: {last_error})")
+            log_error(traceback.format_exc())
+
+    raise RuntimeError(f"All models failed. Last error: {last_error}")
+
+########################################
 # 실행 계획 생성
 ########################################
-def build_execution_plan(model: str, rewritten_request: str) -> dict:
+def build_execution_plan(models: list[str], rewritten_request: str) -> dict:
     system_prompt = """
-You are a task planner.
-
 Return ONLY valid JSON.
-
 Schema:
 {
   "description": "string",
@@ -190,24 +206,13 @@ Schema:
   "output_file": "string | null"
 }
 """
-    progress(f"{model} 에게 실행 계획 요청 중")
-    client = ollama_client()
-    resp = client.chat(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": rewritten_request}
-        ],
-        format="json",
-        stream=False
-    )
-    return json.loads(resp["message"]["content"])
+    return call_with_fallback(models, system_prompt, rewritten_request)
 
 ########################################
 # EXECUTE
 ########################################
 def execute_plan(plan: dict) -> dict:
-    progress("명령어 실행 중 (root)")
+    progress("⏳ 명령어 실행 중 (root)")
     results = []
 
     for cmd in plan.get("commands", []):
@@ -228,8 +233,7 @@ def execute_plan(plan: dict) -> dict:
     if plan.get("output_file"):
         with open(plan["output_file"], "w") as f:
             for r in results:
-                f.write(f"$ {r['command']}\n")
-                f.write(r["stdout"] + "\n\n")
+                f.write(f"$ {r['command']}\n{r['stdout']}\n\n")
 
     return {
         "mode": "EXECUTE",
@@ -239,22 +243,14 @@ def execute_plan(plan: dict) -> dict:
     }
 
 ########################################
-# REPORT (설명 전용)
+# REPORT
 ########################################
-def generate_report(model: str, rewritten_request: str) -> dict:
-    progress(f"{model} 에게 report 요청 중")
-    client = ollama_client()
-    resp = client.chat(
-        model=model,
-        messages=[
-            {"role": "system", "content": "Explain the request clearly for an operator."},
-            {"role": "user", "content": rewritten_request}
-        ],
-        stream=False
-    )
+def generate_report(models: list[str], rewritten_request: str) -> dict:
+    system_prompt = "Explain the request clearly for an operator."
+    result = call_with_fallback(models, system_prompt, rewritten_request)
     return {
         "mode": "REPORT",
-        "report": resp["message"]["content"]
+        "report": result
     }
 
 ########################################
@@ -262,33 +258,26 @@ def generate_report(model: str, rewritten_request: str) -> dict:
 ########################################
 def handle_input(user_input: str) -> dict:
     report_mode = is_report_mode(user_input)
-
     cls = classify_request(user_input)
 
+    nature = cls.get("nature", "unknown")
     if cls.get("confidence", 0.0) < CONFIDENCE_THRESHOLD:
-        cls["nature"] = "unknown"
+        nature = "unknown"
 
-    nature = cls["nature"]
-    rewritten = cls["rewritten_request"]
+    rewritten = cls.get("rewritten_request", user_input)
+    models = MODEL_CHAINS.get(nature, MODEL_CHAINS["unknown"])
 
-    # report mode는 문자열 룰 기반 ONLY
     if report_mode:
-        return generate_report(
-            MODEL_ROUTING["explanatory"],
-            rewritten
-        )
+        return generate_report(models, rewritten)
 
-    # 여기부터는 무조건 EXECUTE
-    model = MODEL_ROUTING.get(nature, MODEL_ROUTING["unknown"])
-    progress(f"라우팅 결정: {nature} → {model}")
-    plan = build_execution_plan(model, rewritten)
+    plan = build_execution_plan(models, rewritten)
     return execute_plan(plan)
 
 ########################################
 # CLI
 ########################################
 def run_cli():
-    print("=== MCP CLI (with progress) ===")
+    print("=== MCP CLI ===")
     while True:
         try:
             text = input("\nMCP> ").strip()
