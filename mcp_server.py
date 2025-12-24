@@ -11,13 +11,26 @@ from datetime import datetime
 from ollama import Client
 
 ########################################
-# 기본 경로 설정
+# 기본 경로 설정 (기존 유지)
 ########################################
 MCP_DIR = Path("/home/ubuntu/mcp")
 LOG_FILE = MCP_DIR / "error.log"
 STATE_FILE = MCP_DIR / "state.json"
 ENV_FILE = "/etc/mcp.env"
 OLLAMA_MODEL = "gpt-oss:120b"
+
+########################################
+# 실행 상태
+########################################
+LAST_REPORTED_COMMAND = None
+
+REPORT_KEYWORDS = [
+    "report mode",
+    "report_only",
+    "report-only",
+    "--report",
+    "[report]"
+]
 
 ########################################
 # 공통 유틸
@@ -28,13 +41,9 @@ def log_error(msg: str):
         f.write(f"[{datetime.now()}] {msg}\n")
 
 ########################################
-# 환경변수 로딩 (지연 로딩)
+# 환경변수 로딩 (기존 유지)
 ########################################
 def ensure_env_loaded():
-    """
-    - systemd(root) 실행: 이미 로드됨
-    - sudo / CLI 실행: /etc/mcp.env 직접 로드
-    """
     if os.environ.get("OLLAMA_API_KEY"):
         return
 
@@ -46,204 +55,220 @@ def ensure_env_loaded():
         with open(ENV_FILE, "r") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" not in line:
+                if not line or line.startswith("#") or "=" not in line:
                     continue
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k, v)
     except Exception as e:
         log_error(f"Failed to load env file: {e}")
 
-def get_api_key() -> str | None:
-    return os.environ.get("OLLAMA_API_KEY")
-
 ########################################
-# 상태 하트비트
+# 상태 하트비트 (기존 유지)
 ########################################
 def update_heartbeat():
     while True:
         try:
-            STATE_FILE.write_text(
-                json.dumps({
-                    "last_heartbeat": time.time(),
-                    "status": "running"
-                })
-            )
+            STATE_FILE.write_text(json.dumps({
+                "last_heartbeat": time.time(),
+                "status": "running"
+            }))
         except Exception:
             pass
         time.sleep(10)
 
 ########################################
-# Fallback
+# 판단 로직 (NEW)
 ########################################
-def rule_based_fallback(prompt: str, reason: str) -> dict:
-    return {
-        "decision": "NO_ACTION",
-        "reason": f"Fallback: {reason}",
-        "actions": [],
-        "notes": prompt[:200]
-    }
+def is_report_mode(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in REPORT_KEYWORDS)
+
+def strip_report_keywords(cmd: str) -> str:
+    for k in REPORT_KEYWORDS:
+        cmd = cmd.replace(k, "")
+    return cmd.strip()
 
 ########################################
-# LLM 호출
+# LLM (REPORT 전용, 선택적)
 ########################################
-def call_llm(prompt: str) -> dict:
-    api_key = get_api_key()
-    if not api_key:
-        raise RuntimeError("OLLAMA_API_KEY not set")
-
-    client = Client(
-        host="https://ollama.com",
-        headers={"Authorization": f"Bearer {api_key}"}
-    )
-
-    system_prompt = """
-Return ONLY valid JSON.
-Schema:
-{
-  "decision": "APPLY_FIX | REPORT_ONLY | NO_ACTION",
-  "reason": "string",
-  "actions": [
-    {
-      "type": "shell | edit_file",
-      "command": "string",
-      "file": "string",
-      "diff": "string"
-    }
-  ]
-}
-"""
-
+def call_llm_for_report(prompt: str) -> str:
     try:
+        api_key = os.environ.get("OLLAMA_API_KEY")
+        if not api_key:
+            return "LLM API Key가 설정되지 않았습니다."
+
+        client = Client(
+            host="https://ollama.com",
+            headers={"Authorization": f"Bearer {api_key}"}
+        )
+
         response = client.chat(
             model=OLLAMA_MODEL,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": "운영자에게 설명하는 보고용 요약만 생성하세요."},
                 {"role": "user", "content": prompt},
             ],
-            stream=False,
-            format="json"
+            stream=False
         )
-        return json.loads(response["message"]["content"])
 
-    except json.JSONDecodeError:
-        log_error("JSON parse error from LLM")
-        return rule_based_fallback(prompt, "Invalid JSON from LLM")
+        return response["message"]["content"]
+
     except Exception as e:
-        log_error(f"LLM call error: {e}\n{traceback.format_exc()}")
-        return rule_based_fallback(prompt, "LLM API Error")
+        log_error(f"LLM report error: {e}")
+        return "LLM 보고 생성 중 오류 발생"
 
 ########################################
-# 액션 실행
+# EXECUTE (root)
 ########################################
-def apply_actions(actions: list):
-    results = []
-    for action in actions:
-        try:
-            if action["type"] == "shell":
-                proc = subprocess.run(
-                    action["command"],
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                results.append(
-                    f"CMD[{proc.returncode}]: {action['command']}"
-                )
+def execute_command(command: str) -> dict:
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            text=True,
+            capture_output=True,
+            timeout=60
+        )
 
-            elif action["type"] == "edit_file":
-                with open(action["file"], "a") as f:
-                    f.write(f"\n# MCP AUTO PATCH {datetime.now()}\n")
-                    f.write(action.get("diff", ""))
-                results.append(f"EDIT: {action['file']}")
+        return {
+            "mode": "EXECUTE",
+            "command": command,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip()
+        }
 
-        except Exception as e:
-            log_error(f"Action failed: {action} -> {e}")
-            results.append(f"FAIL: {action}")
-
-    return results
+    except Exception as e:
+        log_error(f"Execution error: {e}")
+        return {
+            "mode": "EXECUTE",
+            "error": str(e)
+        }
 
 ########################################
-# 이벤트 처리
+# REPORT_ONLY
 ########################################
-def handle_event(prompt: str) -> dict:
-    result = call_llm(prompt)
+def report_only(raw_input: str) -> dict:
+    global LAST_REPORTED_COMMAND
 
-    if result.get("decision") == "APPLY_FIX":
-        logs = apply_actions(result.get("actions", []))
-        result["action_logs"] = logs
+    cleaned = strip_report_keywords(raw_input)
+    LAST_REPORTED_COMMAND = cleaned
 
-    return result
+    llm_summary = call_llm_for_report(
+        f"다음 명령을 실행하기 전 점검 관점에서 설명하세요:\n{cleaned}"
+    )
+
+    return {
+        "mode": "REPORT_ONLY",
+        "요청_내용": raw_input,
+        "실행_예정_명령": cleaned,
+        "설명": (
+            "현재 요청은 report mode로 처리되었습니다.\n"
+            "아래 명령은 EXECUTE 모드였다면 root 권한으로 실행됩니다.\n\n"
+            f"[LLM 요약]\n{llm_summary}\n\n"
+            "실행 방법:\n"
+            "  run         : 실행\n"
+            "  run --force : 확인 없이 실행"
+        )
+    }
+
+########################################
+# 출력
+########################################
+def print_execute(r: dict):
+    print("\n=== EXECUTE RESULT ===")
+    print(f"command    : {r.get('command')}")
+    print(f"returncode : {r.get('returncode')}")
+    if r.get("stdout"):
+        print("\n[STDOUT]\n" + r["stdout"])
+    if r.get("stderr"):
+        print("\n[STDERR]\n" + r["stderr"])
+    print("======================\n")
+
+def print_report(r: dict):
+    print("\n=== REPORT MODE ===")
+    print(f"요청 내용 : {r['요청_내용']}")
+    print("\n[실행 예정 명령]")
+    print(r["실행_예정_명령"])
+    print("\n[설명]")
+    print(r["설명"])
+    print("===================\n")
+
+########################################
+# CLI / STDIO 공용
+########################################
+def process_input(text: str):
+    global LAST_REPORTED_COMMAND
+
+    if text.lower() == "run --force":
+        if not LAST_REPORTED_COMMAND:
+            return {"error": "실행할 report 명령 없음"}
+        result = execute_command(LAST_REPORTED_COMMAND)
+        LAST_REPORTED_COMMAND = None
+        return result
+
+    if text.lower() == "run":
+        if not LAST_REPORTED_COMMAND:
+            return {"error": "실행할 report 명령 없음"}
+        result = execute_command(LAST_REPORTED_COMMAND)
+        LAST_REPORTED_COMMAND = None
+        return result
+
+    if is_report_mode(text):
+        return report_only(text)
+
+    return execute_command(text)
 
 ########################################
 # CLI 모드
 ########################################
 def run_cli_mode():
-    print("======================================")
-    print(" MCP CLI MODE")
-    print(" type 'quit' to exit")
-    print("======================================")
-
-    busy = False
-
+    print("=== MCP CLI MODE (Hybrid) ===")
     while True:
         try:
-            user_input = input("\nMCP> ").strip()
-
-            if user_input.lower() == "quit":
-                print("Bye.")
+            text = input("\nMCP> ").strip()
+            if text.lower() in ("quit", "exit"):
                 return
-
-            if busy:
-                print("⚠️ MCP is processing. Input ignored.")
-                continue
-
-            if not user_input:
-                continue
-
-            busy = True
-            print("⏳ processing...")
-
-            result = handle_event(user_input)
-            print(json.dumps(result, indent=2))
-
+            result = process_input(text)
+            if result.get("mode") == "REPORT_ONLY":
+                print_report(result)
+            elif result.get("mode") == "EXECUTE":
+                print_execute(result)
+            else:
+                print(result)
         except Exception as e:
-            log_error(f"CLI Error: {e}")
-            print(json.dumps(rule_based_fallback("CLI", "System Error"), indent=2))
-        finally:
-            busy = False
+            log_error(str(e))
+            print("오류 발생")
 
 ########################################
-# STDIO 서버 모드
+# STDIO 모드
 ########################################
 def run_stdio_mode():
     while True:
         try:
-            prompt = input()
-            if not prompt:
+            text = input()
+            if not text:
                 continue
-            result = handle_event(prompt)
+            result = process_input(text)
             print(json.dumps(result))
         except EOFError:
             return
-        except Exception as e:
-            log_error(f"STDIO Error: {e}")
-            print(json.dumps(rule_based_fallback("STDIO", "System Error")))
 
 ########################################
 # Main
 ########################################
 def main():
+    if os.geteuid() != 0:
+        print("❌ MCP must be run as root")
+        return
+
     ensure_env_loaded()
+
+    threading.Thread(target=update_heartbeat, daemon=True).start()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--cli", action="store_true")
     args = parser.parse_args()
-
-    t = threading.Thread(target=update_heartbeat, daemon=True)
-    t.start()
 
     if args.cli:
         run_cli_mode()
