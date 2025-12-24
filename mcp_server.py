@@ -26,7 +26,7 @@ MODEL_CLASSIFIER = "nemotron-3-nano:30b-cloud"
 MODEL_ROUTING = {
     "server_operation": "gpt-oss:120b",
     "code_generation": "devstral-2:123b-cloud",
-    "report_only": "gemini-3-flash-preview:cloud",
+    "explanatory": "gemini-3-flash-preview:cloud",
     "unknown": "ministral-3:14b",
 }
 
@@ -114,13 +114,13 @@ You are an intent classification and request rewriting engine.
 Rules:
 - Output ONLY valid JSON
 - Do NOT generate commands
-- Do NOT decide report mode
+- Do NOT decide execution or report mode
 - Be concise
 
-Categories:
+Nature values:
 - server_operation
 - code_generation
-- report_only
+- explanatory
 - unknown
 """
 
@@ -130,7 +130,7 @@ User request:
 
 Return JSON:
 {{
-  "category": "server_operation | code_generation | report_only | unknown",
+  "nature": "server_operation | code_generation | explanatory | unknown",
   "intent": "string",
   "rewritten_request": "string",
   "key_requirements": ["string"],
@@ -156,7 +156,7 @@ Return JSON:
     except Exception as e:
         log_error(f"classify error: {e}")
         return {
-            "category": "unknown",
+            "nature": "unknown",
             "intent": "classification_failed",
             "rewritten_request": user_input,
             "key_requirements": [],
@@ -228,20 +228,20 @@ def execute_plan(plan: dict) -> dict:
     }
 
 ########################################
-# REPORT_ONLY
+# REPORT (설명 전용)
 ########################################
 def generate_report(model: str, rewritten_request: str) -> dict:
     client = ollama_client()
     resp = client.chat(
         model=model,
         messages=[
-            {"role": "system", "content": "Explain the task clearly for an operator."},
+            {"role": "system", "content": "Explain the request clearly for an operator."},
             {"role": "user", "content": rewritten_request}
         ],
         stream=False
     )
     return {
-        "mode": "REPORT_ONLY",
+        "mode": "REPORT",
         "report": resp["message"]["content"]
     }
 
@@ -253,20 +253,21 @@ def handle_input(user_input: str) -> dict:
 
     cls = classify_request(user_input)
 
-    if cls["confidence"] < CONFIDENCE_THRESHOLD:
-        cls["category"] = "unknown"
+    if cls.get("confidence", 0.0) < CONFIDENCE_THRESHOLD:
+        cls["nature"] = "unknown"
 
-    category = cls["category"]
+    nature = cls["nature"]
     rewritten = cls["rewritten_request"]
 
-    # report mode는 실행 모델 호출 금지
-    if report_mode or category == "report_only":
+    # ✅ 실행 여부는 오직 report_mode 문자열 룰로만 판단
+    if report_mode:
         return generate_report(
-            MODEL_ROUTING["report_only"],
+            MODEL_ROUTING["explanatory"],
             rewritten
         )
 
-    model = MODEL_ROUTING.get(category, MODEL_ROUTING["unknown"])
+    # 여기부터는 무조건 EXECUTE 흐름
+    model = MODEL_ROUTING.get(nature, MODEL_ROUTING["unknown"])
     plan = build_execution_plan(model, rewritten)
     return execute_plan(plan)
 
@@ -274,7 +275,7 @@ def handle_input(user_input: str) -> dict:
 # CLI
 ########################################
 def run_cli():
-    print("=== MCP CLI (Final / Cost Optimized) ===")
+    print("=== MCP CLI (Final / Explanatory Naming) ===")
     while True:
         try:
             text = input("\nMCP> ").strip()
