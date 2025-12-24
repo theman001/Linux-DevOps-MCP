@@ -3,34 +3,49 @@ import os
 import json
 import time
 import threading
-import traceback
 import subprocess
 import argparse
+import traceback
 from pathlib import Path
 from datetime import datetime
 from ollama import Client
 
 ########################################
-# 기본 경로 설정 (기존 유지)
+# 기본 경로 / 설정
 ########################################
 MCP_DIR = Path("/home/ubuntu/mcp")
 LOG_FILE = MCP_DIR / "error.log"
 STATE_FILE = MCP_DIR / "state.json"
 ENV_FILE = "/etc/mcp.env"
-OLLAMA_MODEL = "gpt-oss:120b"
 
 ########################################
-# 실행 상태
+# 모델 정책 (확정)
 ########################################
-LAST_REPORTED_COMMAND = None
+MODEL_CLASSIFIER = "nemotron-3-nano:30b-cloud"
 
+MODEL_ROUTING = {
+    "server_operation": "gpt-oss:120b",
+    "code_generation": "devstral-2:123b-cloud",
+    "report_only": "gemini-3-flash-preview:cloud",
+    "unknown": "ministral-3:14b",
+}
+
+CONFIDENCE_THRESHOLD = 0.6
+
+########################################
+# report mode 판단 (룰 기반 ONLY)
+########################################
 REPORT_KEYWORDS = [
     "report mode",
     "report_only",
-    "report-only",
     "--report",
     "[report]"
 ]
+
+########################################
+# 캐시 (토큰 절약)
+########################################
+CLASSIFY_CACHE: dict[str, dict] = {}
 
 ########################################
 # 공통 유틸
@@ -41,29 +56,23 @@ def log_error(msg: str):
         f.write(f"[{datetime.now()}] {msg}\n")
 
 ########################################
-# 환경변수 로딩 (기존 유지)
+# ENV 로딩
 ########################################
 def ensure_env_loaded():
     if os.environ.get("OLLAMA_API_KEY"):
         return
-
     if not os.path.exists(ENV_FILE):
-        log_error("Environment file not found: /etc/mcp.env")
         return
-
-    try:
-        with open(ENV_FILE, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k, v)
-    except Exception as e:
-        log_error(f"Failed to load env file: {e}")
+    with open(ENV_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k, v)
 
 ########################################
-# 상태 하트비트 (기존 유지)
+# Heartbeat
 ########################################
 def update_heartbeat():
     while True:
@@ -77,182 +86,205 @@ def update_heartbeat():
         time.sleep(10)
 
 ########################################
-# 판단 로직 (NEW)
+# Ollama Client
 ########################################
-def is_report_mode(text: str) -> bool:
-    t = text.lower()
+def ollama_client():
+    return Client(
+        host="https://ollama.com",
+        headers={"Authorization": f"Bearer {os.environ.get('OLLAMA_API_KEY')}"}
+    )
+
+########################################
+# report mode 룰 체크
+########################################
+def is_report_mode(user_input: str) -> bool:
+    t = user_input.lower()
     return any(k in t for k in REPORT_KEYWORDS)
 
-def strip_report_keywords(cmd: str) -> str:
-    for k in REPORT_KEYWORDS:
-        cmd = cmd.replace(k, "")
-    return cmd.strip()
+########################################
+# 1차 분류 (nemotron)
+########################################
+def classify_request(user_input: str) -> dict:
+    if user_input in CLASSIFY_CACHE:
+        return CLASSIFY_CACHE[user_input]
 
-########################################
-# LLM (REPORT 전용, 선택적)
-########################################
-def call_llm_for_report(prompt: str) -> str:
+    system_prompt = """
+You are an intent classification and request rewriting engine.
+
+Rules:
+- Output ONLY valid JSON
+- Do NOT generate commands
+- Do NOT decide report mode
+- Be concise
+
+Categories:
+- server_operation
+- code_generation
+- report_only
+- unknown
+"""
+
+    user_prompt = f"""
+User request:
+{user_input}
+
+Return JSON:
+{{
+  "category": "server_operation | code_generation | report_only | unknown",
+  "intent": "string",
+  "rewritten_request": "string",
+  "key_requirements": ["string"],
+  "output_expectation": "string",
+  "confidence": 0.0
+}}
+"""
+
     try:
-        api_key = os.environ.get("OLLAMA_API_KEY")
-        if not api_key:
-            return "LLM API Key가 설정되지 않았습니다."
-
-        client = Client(
-            host="https://ollama.com",
-            headers={"Authorization": f"Bearer {api_key}"}
-        )
-
-        response = client.chat(
-            model=OLLAMA_MODEL,
+        client = ollama_client()
+        resp = client.chat(
+            model=MODEL_CLASSIFIER,
             messages=[
-                {"role": "system", "content": "운영자에게 설명하는 보고용 요약만 생성하세요."},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
             ],
+            format="json",
             stream=False
         )
-
-        return response["message"]["content"]
-
+        result = json.loads(resp["message"]["content"])
+        CLASSIFY_CACHE[user_input] = result
+        return result
     except Exception as e:
-        log_error(f"LLM report error: {e}")
-        return "LLM 보고 생성 중 오류 발생"
+        log_error(f"classify error: {e}")
+        return {
+            "category": "unknown",
+            "intent": "classification_failed",
+            "rewritten_request": user_input,
+            "key_requirements": [],
+            "output_expectation": "",
+            "confidence": 0.0
+        }
 
 ########################################
-# EXECUTE (root)
+# 실행 계획 생성
 ########################################
-def execute_command(command: str) -> dict:
-    try:
+def build_execution_plan(model: str, rewritten_request: str) -> dict:
+    system_prompt = """
+You are a task planner.
+
+Return ONLY valid JSON.
+
+Schema:
+{
+  "description": "string",
+  "commands": ["string"],
+  "output_file": "string | null"
+}
+"""
+
+    client = ollama_client()
+    resp = client.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": rewritten_request}
+        ],
+        format="json",
+        stream=False
+    )
+    return json.loads(resp["message"]["content"])
+
+########################################
+# EXECUTE
+########################################
+def execute_plan(plan: dict) -> dict:
+    results = []
+
+    for cmd in plan.get("commands", []):
         proc = subprocess.run(
-            command,
+            cmd,
             shell=True,
-            text=True,
             capture_output=True,
+            text=True,
             timeout=60
         )
-
-        return {
-            "mode": "EXECUTE",
-            "command": command,
+        results.append({
+            "command": cmd,
             "returncode": proc.returncode,
             "stdout": proc.stdout.strip(),
             "stderr": proc.stderr.strip()
-        }
+        })
 
-    except Exception as e:
-        log_error(f"Execution error: {e}")
-        return {
-            "mode": "EXECUTE",
-            "error": str(e)
-        }
+    if plan.get("output_file"):
+        with open(plan["output_file"], "w") as f:
+            for r in results:
+                f.write(f"$ {r['command']}\n")
+                f.write(r["stdout"] + "\n\n")
+
+    return {
+        "mode": "EXECUTE",
+        "description": plan.get("description"),
+        "results": results,
+        "saved_to": plan.get("output_file")
+    }
 
 ########################################
 # REPORT_ONLY
 ########################################
-def report_only(raw_input: str) -> dict:
-    global LAST_REPORTED_COMMAND
-
-    cleaned = strip_report_keywords(raw_input)
-    LAST_REPORTED_COMMAND = cleaned
-
-    llm_summary = call_llm_for_report(
-        f"다음 명령을 실행하기 전 점검 관점에서 설명하세요:\n{cleaned}"
+def generate_report(model: str, rewritten_request: str) -> dict:
+    client = ollama_client()
+    resp = client.chat(
+        model=model,
+        messages=[
+            {"role": "system", "content": "Explain the task clearly for an operator."},
+            {"role": "user", "content": rewritten_request}
+        ],
+        stream=False
     )
-
     return {
         "mode": "REPORT_ONLY",
-        "요청_내용": raw_input,
-        "실행_예정_명령": cleaned,
-        "설명": (
-            "현재 요청은 report mode로 처리되었습니다.\n"
-            "아래 명령은 EXECUTE 모드였다면 root 권한으로 실행됩니다.\n\n"
-            f"[LLM 요약]\n{llm_summary}\n\n"
-            "실행 방법:\n"
-            "  run         : 실행\n"
-            "  run --force : 확인 없이 실행"
-        )
+        "report": resp["message"]["content"]
     }
 
 ########################################
-# 출력
+# 메인 처리
 ########################################
-def print_execute(r: dict):
-    print("\n=== EXECUTE RESULT ===")
-    print(f"command    : {r.get('command')}")
-    print(f"returncode : {r.get('returncode')}")
-    if r.get("stdout"):
-        print("\n[STDOUT]\n" + r["stdout"])
-    if r.get("stderr"):
-        print("\n[STDERR]\n" + r["stderr"])
-    print("======================\n")
+def handle_input(user_input: str) -> dict:
+    report_mode = is_report_mode(user_input)
 
-def print_report(r: dict):
-    print("\n=== REPORT MODE ===")
-    print(f"요청 내용 : {r['요청_내용']}")
-    print("\n[실행 예정 명령]")
-    print(r["실행_예정_명령"])
-    print("\n[설명]")
-    print(r["설명"])
-    print("===================\n")
+    cls = classify_request(user_input)
 
-########################################
-# CLI / STDIO 공용
-########################################
-def process_input(text: str):
-    global LAST_REPORTED_COMMAND
+    if cls["confidence"] < CONFIDENCE_THRESHOLD:
+        cls["category"] = "unknown"
 
-    if text.lower() == "run --force":
-        if not LAST_REPORTED_COMMAND:
-            return {"error": "실행할 report 명령 없음"}
-        result = execute_command(LAST_REPORTED_COMMAND)
-        LAST_REPORTED_COMMAND = None
-        return result
+    category = cls["category"]
+    rewritten = cls["rewritten_request"]
 
-    if text.lower() == "run":
-        if not LAST_REPORTED_COMMAND:
-            return {"error": "실행할 report 명령 없음"}
-        result = execute_command(LAST_REPORTED_COMMAND)
-        LAST_REPORTED_COMMAND = None
-        return result
+    # report mode는 실행 모델 호출 금지
+    if report_mode or category == "report_only":
+        return generate_report(
+            MODEL_ROUTING["report_only"],
+            rewritten
+        )
 
-    if is_report_mode(text):
-        return report_only(text)
-
-    return execute_command(text)
+    model = MODEL_ROUTING.get(category, MODEL_ROUTING["unknown"])
+    plan = build_execution_plan(model, rewritten)
+    return execute_plan(plan)
 
 ########################################
-# CLI 모드
+# CLI
 ########################################
-def run_cli_mode():
-    print("=== MCP CLI MODE (Hybrid) ===")
+def run_cli():
+    print("=== MCP CLI (Final / Cost Optimized) ===")
     while True:
         try:
             text = input("\nMCP> ").strip()
             if text.lower() in ("quit", "exit"):
                 return
-            result = process_input(text)
-            if result.get("mode") == "REPORT_ONLY":
-                print_report(result)
-            elif result.get("mode") == "EXECUTE":
-                print_execute(result)
-            else:
-                print(result)
-        except Exception as e:
-            log_error(str(e))
-            print("오류 발생")
-
-########################################
-# STDIO 모드
-########################################
-def run_stdio_mode():
-    while True:
-        try:
-            text = input()
-            if not text:
-                continue
-            result = process_input(text)
-            print(json.dumps(result))
-        except EOFError:
-            return
+            result = handle_input(text)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        except Exception:
+            log_error(traceback.format_exc())
+            print("❌ error occurred")
 
 ########################################
 # Main
@@ -263,7 +295,6 @@ def main():
         return
 
     ensure_env_loaded()
-
     threading.Thread(target=update_heartbeat, daemon=True).start()
 
     parser = argparse.ArgumentParser()
@@ -271,9 +302,7 @@ def main():
     args = parser.parse_args()
 
     if args.cli:
-        run_cli_mode()
-    else:
-        run_stdio_mode()
+        run_cli()
 
 if __name__ == "__main__":
     main()
