@@ -69,7 +69,7 @@ def log_error(msg: str):
         f.write(f"[{datetime.now()}] {msg}\n")
 
 def progress(msg: str):
-    print(msg, file=sys.stderr, flush=True)
+    print(f"⏳ {msg}", file=sys.stderr, flush=True)
 
 ########################################
 # ENV 로딩
@@ -81,11 +81,11 @@ def ensure_env_loaded():
         return
     with open(ENV_FILE) as f:
         for line in f:
-            line = line.strip()
+            line=line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k, v)
+            k,v=line.split("=",1)
+            os.environ.setdefault(k,v)
 
 ########################################
 # Heartbeat
@@ -95,7 +95,7 @@ def update_heartbeat():
         try:
             STATE_FILE.write_text(json.dumps({
                 "last_heartbeat": time.time(),
-                "status": "running"
+                "status":"running"
             }))
         except Exception:
             pass
@@ -107,89 +107,179 @@ def update_heartbeat():
 def ollama_client():
     return Client(
         host="https://ollama.com",
-        headers={"Authorization": f"Bearer {os.environ.get('OLLAMA_API_KEY')}"}
+        headers={"Authorization":f"Bearer {os.environ.get('OLLAMA_API_KEY')}"}
     )
 
 ########################################
 # report mode 룰 체크
 ########################################
-def is_report_mode(user_input: str) -> bool:
-    t = user_input.lower()
+def is_report_mode(user_input:str)->bool:
+    t=user_input.lower()
     return any(k in t for k in REPORT_KEYWORDS)
 
 ########################################
 # 1차 분류 (nemotron)
 ########################################
-def classify_request(user_input: str) -> dict:
+CLASSIFIER_PROMPT = r"""
+You are an intent classification and request rewriting engine
+for an automated infrastructure control system.
+
+Your job:
+1. Understand the user's natural language request
+2. Rewrite it into a concise, unambiguous task description
+3. Classify into one of ONLY these categories:
+
+- server_operation
+- code_generation
+- explanatory
+- unknown
+
+DISAMBIGUATION RULES:
+- If the user explicitly requests a Python script, default to code_generation
+  unless the script is only a thin wrapper around shell execution.
+- If both development and OS operation are present,
+  choose code_generation when application-level logic is needed.
+- If unsure, choose unknown.
+
+Output ONLY valid JSON in this shape:
+
+{
+  "nature": "server_operation | code_generation | explanatory | unknown",
+  "rewritten_request": "concise cleaned request",
+  "confidence": 0.0
+}
+
+No markdown. No comments. No explanations.
+"""
+
+def classify_request(user_input:str)->dict:
     if user_input in CLASSIFY_CACHE:
         return CLASSIFY_CACHE[user_input]
 
-    system_prompt = """
-You are an intent classification and request rewriting engine
-for an automated Linux DevOps control assistant.
-
-Your responsibilities:
-1. Understand the user's natural language request
-2. Rewrite it into a concise, unambiguous technical task description
-3. Select ONE best-fitting category
-
-Allowed categories:
-- server_operation   (Linux 운영/관리/자동화/설정/점검/배포/장애조치)
-- code_generation    (스크립트/코드/프로그램 생성/수정/디버깅)
-- explanatory        (설명/해설/지식요청/보고서 형태 요청)
-- unknown            (판단이 어려운 경우)
-
-Important Rules:
-- DO NOT generate shell commands
-- DO NOT generate code
-- DO NOT execute anything
-- Output ONLY valid JSON (NO markdown)
-
-Return format:
-{
-  "nature": "server_operation | code_generation | explanatory | unknown",
-  "rewritten_request": "rewritten task",
-  "confidence": 0.0
-}
-"""
-
     user_prompt = f"""
-User submitted request:
-
+User request:
 {user_input}
-
-Return JSON ONLY.
 """
 
     try:
-        progress("⏳ 요청 분류 중 (nemotron-3-nano)")
+        progress("요청 분류 중 (nemotron-3-nano)")
         client = ollama_client()
         resp = client.chat(
             model=MODEL_CLASSIFIER,
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                {"role":"system","content":CLASSIFIER_PROMPT},
+                {"role":"user","content":user_prompt}
             ],
             format="json",
             stream=False
         )
         result = json.loads(resp["message"]["content"])
-        CLASSIFY_CACHE[user_input] = result
+        CLASSIFY_CACHE[user_input]=result
         return result
     except Exception:
         log_error(traceback.format_exc())
         return {
-            "nature": "unknown",
-            "rewritten_request": user_input,
-            "confidence": 0.0
+            "nature":"unknown",
+            "rewritten_request":user_input,
+            "confidence":0.0
         }
+
+########################################
+# 카테고리별 SYSTEM PROMPTS
+########################################
+PROMPT_SERVER_OP = r"""
+You are a senior Linux / DevOps / SRE engineer.
+
+Your job:
+Convert the user's request into a SAFE execution plan.
+
+VERY IMPORTANT SAFETY RULES
+------------------------------------------------
+1. DO NOT embed shell syntax into source code
+2. DO NOT use heredoc (<<EOF)
+3. DO NOT write redirection (> or >>)
+4. DO NOT include Markdown in the JSON
+5. DO NOT actually execute commands
+6. Return ONLY JSON
+------------------------------------------------
+
+Return JSON exactly in this schema:
+
+{
+  "description": "high level explanation",
+  "files": [
+    {
+      "path": "/abs/or/relative/file/path",
+      "content": "file content ONLY. No shell syntax."
+    }
+  ],
+  "commands": [
+    "linux shell commands ONLY",
+    "never include code here"
+  ],
+  "output_file": "null or filename"
+}
+
+All source code MUST go inside files[].content.
+All shell commands MUST go inside commands[].
+Nothing may mix the two.
+"""
+
+PROMPT_CODE_GEN = r"""
+You are a professional software engineer.
+
+Your task:
+Generate source code or scripts cleanly and safely.
+
+RULES
+------------------------------------------------
+1. DO NOT use heredoc syntax
+2. DO NOT embed shell syntax into source code
+3. DO NOT include markdown fences
+4. All code MUST be returned ONLY inside files[].content
+5. Shell commands belong ONLY in commands[]
+------------------------------------------------
+
+Return JSON in this schema ONLY:
+
+{
+  "description": "what the program does",
+  "files": [
+    {
+      "path": "filename.ext",
+      "content": "program code ONLY"
+    }
+  ],
+  "commands": [
+    "commands to run or prepare the program"
+  ],
+  "output_file": "or null"
+}
+"""
+
+PROMPT_EXPLANATORY = r"""
+You are a Korean technical writer.
+
+Explain the user's request clearly and simply in Korean.
+Do NOT return JSON. Do NOT include code.
+"""
+
+PROMPT_UNKNOWN = r"""
+User intent unclear.
+Explain what information is missing in JSON:
+
+{
+ "error": "string",
+ "missing_information": ["..."]
+}
+"""
 
 ########################################
 # LLM 호출 (자동 스위칭)
 ########################################
-def call_with_fallback(models: list[str], system_prompt: str, user_prompt: str, expect_json=True):
-    last_error = None
-    client = ollama_client()
+def call_with_fallback(models:list[str], system_prompt:str, user_prompt:str)->dict:
+    last_error=None
+    client=ollama_client()
 
     for model in models:
         try:
@@ -197,65 +287,55 @@ def call_with_fallback(models: list[str], system_prompt: str, user_prompt: str, 
             resp = client.chat(
                 model=model,
                 messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
+                    {"role":"system","content":system_prompt},
+                    {"role":"user","content":user_prompt}
                 ],
-                format="json" if expect_json else None,
+                format="json",
                 stream=False
             )
-
-            if expect_json:
-                return json.loads(resp["message"]["content"])
-            else:
-                return resp["message"]["content"]
-
+            return json.loads(resp["message"]["content"])
         except Exception as e:
-            last_error = str(e)
-            progress(f"@@ {model} 요청 실패 (이유: {last_error})")
+            last_error=str(e)
+            progress(f"@@ {model} 실패 (사유: {last_error})")
             log_error(traceback.format_exc())
 
-    raise RuntimeError(f"모든 모델 요청 실패. 마지막 오류: {last_error}")
+    raise RuntimeError(f"All models failed. Last error={last_error}")
 
 ########################################
 # 실행 계획 생성
 ########################################
-def build_execution_plan(models: list[str], rewritten_request: str) -> dict:
+def build_execution_plan(nature:str, rewritten:str)->dict:
+    if nature=="server_operation":
+        prompt=PROMPT_SERVER_OP
+    elif nature=="code_generation":
+        prompt=PROMPT_CODE_GEN
+    elif nature=="explanatory":
+        # explanatory는 자연어이므로 JSON 호출 안 함
+        return {"mode":"REPORT_REQUEST","rewritten_request":rewritten}
+    else:
+        prompt=PROMPT_UNKNOWN
 
-    system_prompt = """
-You are a **senior DevOps / Linux operations engineer**.
-
-Your job:
-Convert the user's rewritten request into a SAFE execution plan.
-
-Return ONLY JSON in the following schema:
-
-{
-  "description": "what will be done in natural language",
-  "commands": [
-    "shell command 1",
-    "shell command 2"
-  ],
-  "output_file": "path or null"
-}
-
-Rules:
-- Commands must be valid Linux shell commands
-- Prefer idempotent & safe commands
-- Never include destructive actions unless explicitly required
-- DO NOT add explanations
-- DO NOT return markdown
-"""
-    return call_with_fallback(models, system_prompt, rewritten_request, expect_json=True)
+    models = MODEL_CHAINS.get(nature, MODEL_CHAINS["unknown"])
+    return call_with_fallback(models, prompt, rewritten)
 
 ########################################
 # EXECUTE
 ########################################
-def execute_plan(plan: dict) -> dict:
-    progress("⏳ 명령어 실행 중 (root)")
-    results = []
+def execute_plan(plan:dict)->dict:
+    progress("명령 실행 준비")
 
-    for cmd in plan.get("commands", []):
-        proc = subprocess.run(
+    results=[]
+
+    # 1️⃣ 코드/파일 생성
+    for f in plan.get("files",[]):
+        path=f["path"]
+        content=f.get("content","")
+        with open(path,"w") as fp:
+            fp.write(content)
+
+    # 2️⃣ 쉘 명령 실행
+    for cmd in plan.get("commands",[]):
+        proc=subprocess.run(
             cmd,
             shell=True,
             capture_output=True,
@@ -263,66 +343,56 @@ def execute_plan(plan: dict) -> dict:
             timeout=60
         )
         results.append({
-            "command": cmd,
-            "returncode": proc.returncode,
-            "stdout": proc.stdout.strip(),
-            "stderr": proc.stderr.strip()
+            "command":cmd,
+            "returncode":proc.returncode,
+            "stdout":proc.stdout.strip(),
+            "stderr":proc.stderr.strip()
         })
 
-    if plan.get("output_file"):
-        with open(plan["output_file"], "w") as f:
-            for r in results:
-                f.write(f"$ {r['command']}\n{r['stdout']}\n\n")
-
     return {
-        "mode": "EXECUTE",
-        "description": plan.get("description"),
-        "results": results,
-        "saved_to": plan.get("output_file")
+        "mode":"EXECUTE",
+        "description":plan.get("description"),
+        "results":results
     }
 
 ########################################
 # REPORT
 ########################################
-def generate_report(models: list[str], rewritten_request: str) -> dict:
-
-    system_prompt = """
-You are an expert Korean technical writer.
-
-Explain the user's request in clear Korean so that a system operator can easily understand it.
-
-Rules:
-- 자연스럽고 명확한 한국어로 작성
-- 불필요한 장황한 표현 금지
-- 요약 + 필요한 경우 bullet 사용
-- JSON 반환 금지
-"""
-
-    result = call_with_fallback(models, system_prompt, rewritten_request, expect_json=False)
-
+def generate_report(text:str)->dict:
+    client=ollama_client()
+    resp=client.chat(
+        model="gemini-3-flash-preview:cloud",
+        messages=[
+            {"role":"system","content":PROMPT_EXPLANATORY},
+            {"role":"user","content":text}
+        ]
+    )
     return {
-        "mode": "REPORT",
-        "report": result
+        "mode":"REPORT",
+        "report":resp["message"]["content"]
     }
 
 ########################################
 # 메인 처리
 ########################################
-def handle_input(user_input: str) -> dict:
-    report_mode = is_report_mode(user_input)
-    cls = classify_request(user_input)
+def handle_input(user_input:str)->dict:
+    report_mode=is_report_mode(user_input)
+    cls=classify_request(user_input)
 
-    nature = cls.get("nature", "unknown")
-    if cls.get("confidence", 0.0) < CONFIDENCE_THRESHOLD:
-        nature = "unknown"
+    nature=cls.get("nature","unknown")
+    if cls.get("confidence",0.0)<CONFIDENCE_THRESHOLD:
+        nature="unknown"
 
-    rewritten = cls.get("rewritten_request", user_input)
-    models = MODEL_CHAINS.get(nature, MODEL_CHAINS["unknown"])
+    rewritten=cls.get("rewritten_request",user_input)
 
-    if report_mode or nature == "explanatory":
-        return generate_report(models, rewritten)
+    if report_mode or nature=="explanatory":
+        return generate_report(rewritten)
 
-    plan = build_execution_plan(models, rewritten)
+    plan=build_execution_plan(nature,rewritten)
+
+    if plan.get("mode")=="REPORT_REQUEST":
+        return generate_report(rewritten)
+
     return execute_plan(plan)
 
 ########################################
@@ -332,11 +402,11 @@ def run_cli():
     print("=== MCP CLI ===")
     while True:
         try:
-            text = input("\nMCP> ").strip()
-            if text.lower() in ("quit", "exit"):
+            text=input("\nMCP> ").strip()
+            if text.lower() in ("quit","exit"):
                 return
-            result = handle_input(text)
-            print(json.dumps(result, indent=2, ensure_ascii=False))
+            result=handle_input(text)
+            print(json.dumps(result,indent=2,ensure_ascii=False))
         except Exception:
             log_error(traceback.format_exc())
             print("❌ error occurred")
@@ -345,19 +415,19 @@ def run_cli():
 # Main
 ########################################
 def main():
-    if os.geteuid() != 0:
-        print("❌ MCP must be run as root", file=sys.stderr)
+    if os.geteuid()!=0:
+        print("❌ MUST RUN AS ROOT",file=sys.stderr)
         return
 
     ensure_env_loaded()
-    threading.Thread(target=update_heartbeat, daemon=True).start()
+    threading.Thread(target=update_heartbeat,daemon=True).start()
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--cli", action="store_true")
-    args = parser.parse_args()
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--cli",action="store_true")
+    args=parser.parse_args()
 
     if args.cli:
         run_cli()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
