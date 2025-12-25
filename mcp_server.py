@@ -118,29 +118,47 @@ def is_report_mode(user_input: str) -> bool:
     return any(k in t for k in REPORT_KEYWORDS)
 
 ########################################
-# 1차 분류
+# 1차 분류 (nemotron)
 ########################################
 def classify_request(user_input: str) -> dict:
     if user_input in CLASSIFY_CACHE:
         return CLASSIFY_CACHE[user_input]
 
     system_prompt = """
-Return ONLY valid JSON.
-Do not generate commands.
-Nature values:
-server_operation | code_generation | explanatory | unknown
+You are an intent classification and request rewriting engine
+for an automated Linux DevOps control assistant.
+
+Your responsibilities:
+1. Understand the user's natural language request
+2. Rewrite it into a concise, unambiguous technical task description
+3. Select ONE best-fitting category
+
+Allowed categories:
+- server_operation   (Linux 운영/관리/자동화/설정/점검/배포/장애조치)
+- code_generation    (스크립트/코드/프로그램 생성/수정/디버깅)
+- explanatory        (설명/해설/지식요청/보고서 형태 요청)
+- unknown            (판단이 어려운 경우)
+
+Important Rules:
+- DO NOT generate shell commands
+- DO NOT generate code
+- DO NOT execute anything
+- Output ONLY valid JSON (NO markdown)
+
+Return format:
+{
+  "nature": "server_operation | code_generation | explanatory | unknown",
+  "rewritten_request": "rewritten task",
+  "confidence": 0.0
+}
 """
 
     user_prompt = f"""
-User request:
+User submitted request:
+
 {user_input}
 
-Return JSON:
-{{
-  "nature": "string",
-  "rewritten_request": "string",
-  "confidence": 0.0
-}}
+Return JSON ONLY.
 """
 
     try:
@@ -158,7 +176,7 @@ Return JSON:
         result = json.loads(resp["message"]["content"])
         CLASSIFY_CACHE[user_input] = result
         return result
-    except Exception as e:
+    except Exception:
         log_error(traceback.format_exc())
         return {
             "nature": "unknown",
@@ -169,7 +187,7 @@ Return JSON:
 ########################################
 # LLM 호출 (자동 스위칭)
 ########################################
-def call_with_fallback(models: list[str], system_prompt: str, user_prompt: str) -> dict:
+def call_with_fallback(models: list[str], system_prompt: str, user_prompt: str, expect_json=True):
     last_error = None
     client = ollama_client()
 
@@ -182,31 +200,52 @@ def call_with_fallback(models: list[str], system_prompt: str, user_prompt: str) 
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                format="json",
+                format="json" if expect_json else None,
                 stream=False
             )
-            return json.loads(resp["message"]["content"])
+
+            if expect_json:
+                return json.loads(resp["message"]["content"])
+            else:
+                return resp["message"]["content"]
+
         except Exception as e:
             last_error = str(e)
-            progress(f"@@ {model} 에 요청 실패 (실패 사유: {last_error})")
+            progress(f"@@ {model} 요청 실패 (이유: {last_error})")
             log_error(traceback.format_exc())
 
-    raise RuntimeError(f"All models failed. Last error: {last_error}")
+    raise RuntimeError(f"모든 모델 요청 실패. 마지막 오류: {last_error}")
 
 ########################################
 # 실행 계획 생성
 ########################################
 def build_execution_plan(models: list[str], rewritten_request: str) -> dict:
+
     system_prompt = """
-Return ONLY valid JSON.
-Schema:
+You are a **senior DevOps / Linux operations engineer**.
+
+Your job:
+Convert the user's rewritten request into a SAFE execution plan.
+
+Return ONLY JSON in the following schema:
+
 {
-  "description": "string",
-  "commands": ["string"],
-  "output_file": "string | null"
+  "description": "what will be done in natural language",
+  "commands": [
+    "shell command 1",
+    "shell command 2"
+  ],
+  "output_file": "path or null"
 }
+
+Rules:
+- Commands must be valid Linux shell commands
+- Prefer idempotent & safe commands
+- Never include destructive actions unless explicitly required
+- DO NOT add explanations
+- DO NOT return markdown
 """
-    return call_with_fallback(models, system_prompt, rewritten_request)
+    return call_with_fallback(models, system_prompt, rewritten_request, expect_json=True)
 
 ########################################
 # EXECUTE
@@ -246,8 +285,21 @@ def execute_plan(plan: dict) -> dict:
 # REPORT
 ########################################
 def generate_report(models: list[str], rewritten_request: str) -> dict:
-    system_prompt = "Explain the request clearly for an operator."
-    result = call_with_fallback(models, system_prompt, rewritten_request)
+
+    system_prompt = """
+You are an expert Korean technical writer.
+
+Explain the user's request in clear Korean so that a system operator can easily understand it.
+
+Rules:
+- 자연스럽고 명확한 한국어로 작성
+- 불필요한 장황한 표현 금지
+- 요약 + 필요한 경우 bullet 사용
+- JSON 반환 금지
+"""
+
+    result = call_with_fallback(models, system_prompt, rewritten_request, expect_json=False)
+
     return {
         "mode": "REPORT",
         "report": result
@@ -267,7 +319,7 @@ def handle_input(user_input: str) -> dict:
     rewritten = cls.get("rewritten_request", user_input)
     models = MODEL_CHAINS.get(nature, MODEL_CHAINS["unknown"])
 
-    if report_mode:
+    if report_mode or nature == "explanatory":
         return generate_report(models, rewritten)
 
     plan = build_execution_plan(models, rewritten)
