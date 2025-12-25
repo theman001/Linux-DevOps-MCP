@@ -12,9 +12,15 @@ from datetime import datetime
 from ollama import Client
 
 ########################################
-# 기본 경로 / 설정
+# MCP DIR (자동 감지 + ENV override)
 ########################################
-MCP_DIR = Path("/home/ubuntu/mcp")
+if os.environ.get("MCP_DIR"):
+    MCP_DIR = Path(os.environ["MCP_DIR"]).expanduser().resolve()
+else:
+    MCP_DIR = Path(__file__).resolve().parent
+
+MCP_DIR.mkdir(parents=True, exist_ok=True)
+
 LOG_FILE = MCP_DIR / "error.log"
 STATE_FILE = MCP_DIR / "state.json"
 ENV_FILE = "/etc/mcp.env"
@@ -266,11 +272,11 @@ Do NOT return JSON. Do NOT include code.
 
 PROMPT_UNKNOWN = r"""
 User intent unclear.
-Explain what information is missing in JSON:
+Return JSON:
 
 {
- "error": "string",
- "missing_information": ["..."]
+ "error": "intent unclear",
+ "missing_information": []
 }
 """
 
@@ -310,7 +316,6 @@ def build_execution_plan(nature:str, rewritten:str)->dict:
     elif nature=="code_generation":
         prompt=PROMPT_CODE_GEN
     elif nature=="explanatory":
-        # explanatory는 자연어이므로 JSON 호출 안 함
         return {"mode":"REPORT_REQUEST","rewritten_request":rewritten}
     else:
         prompt=PROMPT_UNKNOWN
@@ -326,14 +331,14 @@ def execute_plan(plan:dict)->dict:
 
     results=[]
 
-    # 1️⃣ 코드/파일 생성
     for f in plan.get("files",[]):
         path=f["path"]
         content=f.get("content","")
-        with open(path,"w") as fp:
+        p=Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p,"w") as fp:
             fp.write(content)
 
-    # 2️⃣ 쉘 명령 실행
     for cmd in plan.get("commands",[]):
         proc=subprocess.run(
             cmd,
