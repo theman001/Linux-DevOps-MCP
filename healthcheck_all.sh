@@ -4,10 +4,17 @@ echo "======================================"
 echo " Linux Operations MCP full healthcheck"
 echo "======================================"
 
-MCP_DIR="/home/ubuntu/mcp"
+########################################
+# 📍 동적 MCP 경로 설정
+########################################
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+MCP_DIR="$SCRIPT_DIR"
 SERVICE="mcp"
 
 FAIL=0
+
+echo " MCP DIR : $MCP_DIR"
+echo "======================================"
 
 ########################################
 # 1️⃣ systemd 상태
@@ -79,7 +86,7 @@ else
   echo " MCP STATUS: UNHEALTHY"
   echo " Action recommended:"
   echo "   - sudo systemctl restart mcp"
-  echo "   - check /home/ubuntu/mcp/error.log"
+  echo "   - check $MCP_DIR/error.log"
   echo "======================================"
   exit 1
 fi
