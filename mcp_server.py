@@ -31,7 +31,7 @@ MODEL_CHAINS = {
     ],
     "code_generation": [
         "devstral-2:123b-cloud",
-        "qwen3-coder:30b-cloud",
+        "qwen3-coder:480b-cloud",
     ],
     "explanatory": [
         "gemini-3-flash-preview:cloud",
