@@ -1,61 +1,52 @@
 #!/bin/bash
 
-# ───────────────────────────────
-# Root 자동 승격
-# ───────────────────────────────
+# 이미 root면 그대로 진행
 if [ "$EUID" -ne 0 ]; then
   exec sudo "$0" "$@"
 fi
 
 set -e
 
-SERVICE_NAME="mcp"
+########################################
+# DEV → MCP CLI Bridge (NO env sourcing)
+########################################
+
+# 🔥 MCP 설치경로 자동 감지 (systemd 기준)
+MCP_DIR=$(grep WorkingDirectory /etc/systemd/system/mcp.service | awk -F'=' '{print $2}')
+
+MCP_PY="$MCP_DIR/mcp-venv/bin/python"
+MCP_SERVER="$MCP_DIR/mcp_server.py"
 
 echo "======================================"
-echo " MCP CLI Launcher (Auto-Detect Mode)"
+echo " MCP CLI (from DEV venv)"
 echo "======================================"
 
-# ───────────────────────────────
-# 1️⃣ systemd에서 ExecStart 경로 가져오기
-# ───────────────────────────────
-EXEC_CMD=$(systemctl show "$SERVICE_NAME" -p ExecStart --value)
-
-if [ -z "$EXEC_CMD" ]; then
-  echo "❌ ExecStart not found for service: $SERVICE_NAME"
-  echo "👉 MCP가 systemctl 서비스로 설치되었는지 확인하세요"
-  exit 1
-fi
-
-# ExecStart 안에서 python 경로 / script 경로 분리
-MCP_PY=$(echo "$EXEC_CMD" | awk '{print $1}')
-MCP_SERVER=$(echo "$EXEC_CMD" | awk '{print $2}')
-
-echo "📌 Detected:"
-echo " Python  = $MCP_PY"
-echo " Server  = $MCP_SERVER"
+echo "📍 MCP DIR  : $MCP_DIR"
+echo "🐍 MCP PY   : $MCP_PY"
+echo "🖥  MCP SRV : $MCP_SERVER"
 echo ""
 
-# ───────────────────────────────
-# 2️⃣ 파일 검증
-# ───────────────────────────────
+# 1️⃣ MCP Python 확인
 if [ ! -x "$MCP_PY" ]; then
-  echo "❌ MCP Python not executable:"
+  echo "❌ MCP venv python not found or not executable:"
   echo "   $MCP_PY"
   exit 1
 fi
 
+# 2️⃣ MCP 서버 확인
 if [ ! -f "$MCP_SERVER" ]; then
-  echo "❌ MCP server file missing:"
+  echo "❌ MCP server not found:"
   echo "   $MCP_SERVER"
   exit 1
 fi
 
-echo "✅ Valid MCP installation detected"
+echo "✅ Using MCP venv:"
+echo "   $MCP_PY"
 echo ""
-echo "🔐 OLLAMA_API_KEY will load automatically from /etc/mcp.env"
+echo "🔐 MCP will load /etc/mcp.env internally"
 echo ""
 
-# ───────────────────────────────
-# 3️⃣ CLI 실행
-# ───────────────────────────────
+########################################
+# 3️⃣ MCP CLI 실행
+########################################
 exec "$MCP_PY" "$MCP_SERVER" --cli
