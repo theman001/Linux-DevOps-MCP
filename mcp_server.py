@@ -162,6 +162,15 @@ def is_report_mode(user_input):
     return any(k in t for k in REPORT_KEYWORDS)
 
 ########################################
+# JSON 유효성 강제
+########################################
+def safe_load_json(text, default):
+    try:
+        return json.loads(text)
+    except Exception:
+        return default
+
+########################################
 # 1차 분류
 ########################################
 def classify_request(user_input: str, file_ctx=None) -> dict:
@@ -170,16 +179,37 @@ def classify_request(user_input: str, file_ctx=None) -> dict:
         return CLASSIFY_CACHE[key]
 
     system_prompt = """
-You are an intent classification and request rewriting engine.
+You are an intent classifier for Linux/DevOps automation.
 
-Rules:
-- Output ONLY valid JSON
-- Do NOT generate commands
-- Do NOT decide execution or report mode
-- Be concise
+Your ONLY job:
+- Identify the *intent category* of the user request
+- Rewrite the request into a normalized clean form
+- Estimate confidence
 
-Nature values:
-server_operation | code_generation | explanatory | unknown
+You MUST return ONLY valid JSON.
+
+ACCEPTABLE VALUES for field "nature":
+- "server_operation"   (Linux admin, DevOps, commands, scripts)
+- "code_generation"    (programming, debugging, code writing)
+- "explanatory"        (ask for explanation, guides, learning)
+- "unknown"            (unclear / mixed / unsafe / other)
+
+MANDATORY JSON SCHEMA:
+{
+ "nature": "server_operation | code_generation | explanatory | unknown",
+ "rewritten_request": "string",
+ "confidence": number(0.0 - 1.0)
+}
+
+Rules you MUST follow strictly:
+1. Return ONLY JSON. No markdown. No extra text.
+2. rewritten_request MUST be concise but complete
+3. If you are uncertain, set nature="unknown"
+4. If classification confidence is weak, set confidence <= 0.5
+5. DO NOT include opinions
+6. DO NOT include commands
+7. DO NOT embed code blocks
+8. DO NOT hallucinate missing context
 """
 
     user_prompt = {
@@ -199,9 +229,15 @@ server_operation | code_generation | explanatory | unknown
             format="json",
             stream=False
         )
-        result = json.loads(resp["message"]["content"])
+
+        result = safe_load_json(
+            resp["message"]["content"],
+            {"nature": "unknown", "rewritten_request": user_input, "confidence": 0.0}
+        )
+
         CLASSIFY_CACHE[key] = result
         return result
+
     except Exception:
         log_error(traceback.format_exc())
         return {
@@ -242,24 +278,43 @@ def call_with_fallback(models, system_prompt, user_prompt):
 ########################################
 def build_execution_plan(models, rewritten_request, file_ctx):
     system_prompt = """
-You are a Linux DevOps assistant.
+You are a Linux DevOps automation assistant.
 
 Your job:
-- Convert the request into a SAFE execution plan
-- RETURN ONLY VALID JSON
+Convert the rewritten request + optional project context into a SAFE execution plan.
 
-Rules:
-- Never embed shell redirection into code files unless explicitly required
-- Prefer pure script output w/o here-doc unless really requested
-- Avoid creating secrets or credentials
-- Output format must be:
+YOU MUST RETURN JSON ONLY:
 
 {
  "description": "string",
- "commands": ["cmd", "cmd2"],
- "output_file": "string | null"
+ "commands": ["string", ...],
+ "output_file": "string or null"
 }
+
+MANDATORY SAFETY RULES
+You MUST NOT recommend commands that:
+- delete or destroy system files
+- remove packages or format disks
+- modify bootloader or kernel
+- disable security protections
+- create/modify system users
+- modify sudoers
+- reboot or shutdown
+- execute malware or attacks
+- access secrets
+- require interactive input
+
+If the user request appears unsafe:
+- commands MUST be []
+- description MUST explain WHY it was blocked
+
+COMMAND RULES
+- Commands MUST be POSIX shell compatible
+- No here-docs unless explicitly required
+- Do NOT embed authentication secrets
+- Avoid environment-dependent side effects
 """
+
     return call_with_fallback(
         models,
         system_prompt,
@@ -276,7 +331,11 @@ def execute_plan(plan):
     progress("⏳ 명령어 실행 중 (root)")
     results = []
 
-    for cmd in plan.get("commands", []):
+    commands = plan.get("commands", [])
+    if not isinstance(commands, list):
+        commands = []
+
+    for cmd in commands:
         proc = subprocess.run(
             cmd,
             shell=True,
@@ -302,7 +361,24 @@ def execute_plan(plan):
 # REPORT
 ########################################
 def generate_report(models, rewritten_request, file_ctx):
-    system_prompt = "Explain clearly in Korean for a Linux operator."
+    system_prompt = """
+You are a Korean-language technical explainer for Linux DevOps.
+
+You MUST return ONLY JSON:
+
+{
+ "summary": "string",
+ "steps": ["string", ...],
+ "risk": "low | medium | high"
+}
+
+Rules:
+- Output must be Korean
+- No markdown
+- No code fences
+- No emojis
+"""
+
     res = call_with_fallback(
         models,
         system_prompt,
@@ -360,16 +436,14 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--cli", action="store_true")
-    parser.add_argument("--text", type=str)  # 웹 핸들러를 위한 인자 추가
+    parser.add_argument("--text", type=str)
     args = parser.parse_args()
 
     if args.cli:
         run_cli()
     elif args.text:
         try:
-            # handle_input 함수를 호출하여 AI 로직 수행
             result = handle_input(args.text)
-            # 결과를 JSON 문자열로 출력 (Go 서버가 이를 읽음)
             print(json.dumps(result, ensure_ascii=False))
         except Exception:
             log_error(traceback.format_exc())
