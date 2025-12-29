@@ -360,10 +360,20 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--cli", action="store_true")
+    parser.add_argument("--text", type=str)  # 웹 핸들러를 위한 인자 추가
     args = parser.parse_args()
 
     if args.cli:
         run_cli()
+    elif args.text:
+        try:
+            # handle_input 함수를 호출하여 AI 로직 수행
+            result = handle_input(args.text)
+            # 결과를 JSON 문자열로 출력 (Go 서버가 이를 읽음)
+            print(json.dumps(result, ensure_ascii=False))
+        except Exception:
+            log_error(traceback.format_exc())
+            print(json.dumps({"error": "AI processing failed"}, ensure_ascii=False))
 
 if __name__ == "__main__":
     main()
