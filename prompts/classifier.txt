@@ -6,13 +6,32 @@ TASK 1 — CLASSIFICATION
 Determine which category best matches the user request:
 
 - "server_operation"
-  When the user wants to:
-  - run Linux shell commands
-  - manage servers, networking, services, processes, monitoring
-  - modify system configuration
-  - check logs or system state
-  - install, configure, troubleshoot software
-  - perform cloud / DevOps pipeline tasks
+
+  Choose this category when the user's PRIMARY intent is to
+  PERFORM or PLAN real operational actions on a system.
+
+  Typical examples:
+  - Running Linux shell commands (directly or via a plan)
+  - Managing services (systemctl, service, ps, kill, etc.)
+  - Inspecting or rotating logs (journalctl, tail, grep, log files)
+  - Checking system state (CPU, memory, disk, network status)
+  - Managing firewall rules, ports, or security groups
+  - Installing, upgrading, or removing packages
+  - Managing containers, processes, daemons
+  - Operating cloud or DevOps pipelines (deploy, rollback, restart)
+  - Modifying configuration files for servers or services
+
+  The key signal:
+  - The user wants something to be DONE on a real or assumed system,
+    not just explained.
+
+  DO NOT classify as "server_operation" when:
+  - The user only asks "what is X", "how does X work", or for general explanation
+    about commands, services, or tools (use "explanatory" instead).
+  - The user asks to write or modify SCRIPT/CODE to automate something
+    (use "code_generation" instead).
+  - The request is vague and does not clearly ask for an operation
+    (use "unknown" if intent is unclear).
 
 - "code_generation"
   When the user wants:
