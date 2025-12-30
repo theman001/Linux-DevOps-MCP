@@ -21,22 +21,16 @@ LOG_FILE = BASE_DIR / "error.log"
 ENV_FILE = "/etc/mcp.env"
 
 PROMPT_DIR = BASE_DIR / "prompts"
-PROMPT_DIR.mkdir(exist_ok=True)
-
-PROMPT_FILES = {
-    "classifier": "classifier.txt",
-    "server_operation": "server_operation.txt",
-    "code_generation": "code_generation.txt",
-    "explanatory": "explanatory.txt",
-    "unknown": "unknown.txt",
-}
+CLASSIFIER_FILE = PROMPT_DIR / "classifier.txt"
+PLANNER_FILE = PROMPT_DIR / "planner.txt"
+REPORTER_FILE = PROMPT_DIR / "reporter.txt"
 
 ########################################
 # Logging
 ########################################
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger("MCP-Server")
@@ -68,32 +62,15 @@ MODEL_CHAINS = {
 CONFIDENCE_THRESHOLD = 0.6
 
 ########################################
-# Triggers
+# Allowed file extensions for context
 ########################################
-REPORT_KEYWORDS = [
-    "report mode",
-    "report_only",
-    "--report",
-    "[report]"
-]
-
-CONTEXT_TRIGGERS = [
-    "이 폴더",
-    "현재 폴더",
-    "파일 참고",
-    "코드 참고",
-    "스크립트 참고",
-    "project",
-    "context"
-]
+ALLOWED_EXT = (
+    ".py", ".sh", ".conf", ".yaml", ".yml",
+    ".json", ".ini", ".cfg", ".go", ".js", ".ts"
+)
 
 ########################################
-# Cache
-########################################
-CLASSIFY_CACHE = {}
-
-########################################
-# Utils
+# Utilities
 ########################################
 def log_error(msg):
     LOG_FILE.parent.mkdir(exist_ok=True)
@@ -104,25 +81,14 @@ def progress(msg):
     print(msg, file=sys.stderr, flush=True)
 
 ########################################
-# Prompt Loader (HOT RELOAD)
-########################################
-def load_prompt(name: str) -> str:
-    filename = PROMPT_FILES.get(name, name)
-    path = PROMPT_DIR / filename
-    try:
-        return path.read_text(encoding="utf-8")
-    except Exception as e:
-        log_error(f"prompt load failed {filename}: {e}")
-        return ""
-
-########################################
-# ENV load
+# ENV loader
 ########################################
 def ensure_env_loaded():
     if os.environ.get("OLLAMA_API_KEY"):
         return
     if not os.path.exists(ENV_FILE):
         return
+
     with open(ENV_FILE) as f:
         for line in f:
             if "=" in line and not line.strip().startswith("#"):
@@ -139,151 +105,163 @@ def ollama_client():
     )
 
 ########################################
-# Context loader (masked)
+# JSON safe loader
 ########################################
-SENSITIVE_PATTERN = re.compile(
-    r"(api[_-]?key|password|secret|token|auth|authorization)",
-    re.IGNORECASE
-)
-
-ALLOWED_EXT = (".py", ".sh", ".conf", ".yml", ".yaml", ".json")
-
-def should_attach_context(user_input: str) -> bool:
-    t = user_input.lower()
-    return any(k.lower() in t for k in CONTEXT_TRIGGERS)
-
-def load_file_context(max_per_file=60000, max_total=250000):
-    ctx = {}
-    total = 0
-    for path in BASE_DIR.glob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in ALLOWED_EXT:
-            continue
-        try:
-            data = path.read_text(errors="ignore")
-            if len(data) > max_per_file:
-                data = data[:max_per_file] + "\n...[TRUNCATED]"
-            data = SENSITIVE_PATTERN.sub("[MASKED]", data)
-            new_total = total + len(data)
-            if new_total > max_total:
-                break
-            ctx[path.name] = data
-            total = new_total
-        except Exception as e:
-            log_error(f"context load fail {path}: {e}")
-    return ctx
-
-########################################
-# Report mode detect
-########################################
-def is_report_mode(user_input):
-    t = user_input.lower()
-    return any(k in t for k in REPORT_KEYWORDS)
-
-########################################
-# Safe JSON load
-########################################
-def safe_load_json(text, default):
+def safe_load_json(text, default=None):
     try:
-        clean_text = re.sub(r"```json\s*|\s*```", "", text).strip()
-        return json.loads(clean_text)
+        clean = re.sub(r"```json\s*|\s*```", "", text).strip()
+        return json.loads(clean)
     except Exception:
         return default
 
 ########################################
+# Prompt loaders (hot reload)
+########################################
+def load_prompt(path: Path):
+    if not path.exists():
+        raise RuntimeError(f"Prompt not found: {path}")
+    return path.read_text()
+
+########################################
 # Classifier
 ########################################
-def classify_request(user_input: str, file_ctx=None) -> dict:
-    key = (user_input, bool(file_ctx))
-    if key in CLASSIFY_CACHE:
-        return CLASSIFY_CACHE[key]
-
-    system_prompt = load_prompt("classifier")
-
-    user_prompt = {
-        "user_request": user_input,
-        "project_context": file_ctx or {}
-    }
-
+def classify(user_input):
     try:
-        progress(f"[CLASSIFIER] {MODEL_CLASSIFIER} → 요청 분류중...")
+        system_prompt = load_prompt(CLASSIFIER_FILE)
         client = ollama_client()
+
+        progress("🔍 Classifier 호출 (nemotron-3-nano)")
+
         resp = client.chat(
             model=MODEL_CLASSIFIER,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_prompt)}
+                {"role": "user", "content": user_input}
             ],
             format="json",
             stream=False
         )
 
-        result = safe_load_json(
-            resp["message"]["content"],
-            {"nature": "unknown", "rewritten_request": user_input, "confidence": 0.0}
-        )
+        parsed = safe_load_json(resp["message"]["content"], {})
 
-        CLASSIFY_CACHE[key] = result
-        return result
+        return {
+            "category": parsed.get("category", "unknown"),
+            "confidence": parsed.get("confidence", 0.0),
+            "needs_context": parsed.get("needs_context", False),
+            "reason": parsed.get("reason", "")
+        }
 
     except Exception:
         log_error(traceback.format_exc())
-        return {"nature": "unknown", "rewritten_request": user_input, "confidence": 0.0}
+        return {
+            "category": "unknown",
+            "confidence": 0.0,
+            "needs_context": False,
+            "reason": "classification failed"
+        }
 
 ########################################
-# Fallback invocation
+# Context loader
 ########################################
-def call_with_fallback(models, system_prompt, user_prompt, nature="unknown"):
+def load_project_context(max_per_file=60000, max_total=250000):
+    ctx = {}
+    total = 0
+
+    for path in BASE_DIR.glob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in ALLOWED_EXT:
+            continue
+
+        try:
+            data = path.read_text(errors="ignore")
+            if len(data) > max_per_file:
+                data = data[:max_per_file] + "\n...[TRUNCATED]"
+
+            if total + len(data) > max_total:
+                break
+
+            ctx[path.name] = data
+            total += len(data)
+
+        except Exception:
+            continue
+
+    return ctx
+
+########################################
+# Model chain executor
+########################################
+def call_with_models(models, system_prompt, user_payload):
     client = ollama_client()
     last = None
+
     for model in models:
         try:
-            progress(f"[{nature.upper()}] {model} → 요청 처리중...")
+            progress(f"🤖 모델 호출: {model}")
+
             resp = client.chat(
                 model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(user_prompt)}
+                    {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
                 ],
                 format="json",
                 stream=False
             )
+
             return safe_load_json(resp["message"]["content"], {})
+
         except Exception as e:
             last = str(e)
             log_error(traceback.format_exc())
-            progress(f"[{nature.upper()}] {model} → 실패: {last}")
+            progress(f"⚠️ 실패: {model}: {last}")
+
     raise RuntimeError(last)
 
 ########################################
-# Execution plan builder
+# Planner
 ########################################
-def build_execution_plan(models, rewritten_request, file_ctx, nature):
-    system_prompt = load_prompt(nature)
+def build_execution_plan(models, rewritten_request, ctx):
+    system_prompt = load_prompt(PLANNER_FILE)
 
-    return call_with_fallback(
-        models,
-        system_prompt,
-        {"rewritten_request": rewritten_request, "project_context": file_ctx or {}},
-        nature=nature
-    )
+    payload = {
+        "rewritten_request": rewritten_request,
+        "project_context": ctx or {}
+    }
+
+    return call_with_models(models, system_prompt, payload)
 
 ########################################
-# EXECUTE — SAFE MODE
+# Reporter
+########################################
+def generate_report(models, rewritten_request, ctx):
+    system_prompt = load_prompt(REPORTER_FILE)
+
+    payload = {
+        "rewritten_request": rewritten_request,
+        "project_context": ctx or {}
+    }
+
+    res = call_with_models(models, system_prompt, payload)
+
+    return {"mode": "REPORT", "report": res}
+
+########################################
+# Executor
 ########################################
 def execute_plan(plan):
     commands = plan.get("commands", [])
     if not isinstance(commands, list):
         commands = []
 
-    if len(commands) == 0:
+    if not commands:
         return {
             "mode": "NO_EXEC",
-            "description": plan.get("description", "No commands to execute")
+            "description": plan.get("description", "No commands generated")
         }
 
-    progress("[EXECUTE] root 권한으로 명령 실행중...")
+    progress("🛠 명령 실행 중...")
 
     results = []
     for cmd in commands:
@@ -294,14 +272,13 @@ def execute_plan(plan):
             text=True,
             timeout=90
         )
+
         results.append({
             "command": cmd,
             "returncode": proc.returncode,
             "stdout": proc.stdout.strip(),
-            "stderr": proc.stderr.strip()
+            "stderr": proc.stderr.strip(),
         })
-
-    progress("[EXECUTE] 완료")
 
     return {
         "mode": "EXECUTE",
@@ -311,58 +288,50 @@ def execute_plan(plan):
     }
 
 ########################################
-# REPORT — JSON ONLY
+# Dispatcher
 ########################################
-def generate_report(models, rewritten_request, file_ctx, nature):
-    system_prompt = load_prompt(nature)
+def handle_input(text):
+    cls = classify(text)
 
-    res = call_with_fallback(
-        models,
-        system_prompt,
-        {"rewritten_request": rewritten_request, "project_context": file_ctx or {}},
-        nature=nature
-    )
-    return {"mode": "REPORT", "report": res}
+    category = cls["category"]
+    confidence = cls["confidence"]
+    needs_ctx = cls["needs_context"]
 
-########################################
-# Main handler
-########################################
-def handle_input(user_input):
-    file_ctx = load_file_context() if should_attach_context(user_input) else {}
-    cls = classify_request(user_input, file_ctx)
-    nature = cls.get("nature", "unknown")
+    if confidence < CONFIDENCE_THRESHOLD:
+        category = "unknown"
 
-    if cls.get("confidence", 0.0) < CONFIDENCE_THRESHOLD:
-        nature = "unknown"
+    models = MODEL_CHAINS.get(category, MODEL_CHAINS["unknown"])
 
-    models = MODEL_CHAINS.get(nature, MODEL_CHAINS["unknown"])
-    rewritten = cls.get("rewritten_request", user_input)
+    progress(f"📌 category={category}, needs_context={needs_ctx}")
 
-    if nature == "explanatory" or is_report_mode(user_input):
-        return generate_report(models, rewritten, file_ctx, nature)
+    ctx = load_project_context() if needs_ctx else {}
 
-    plan = build_execution_plan(models, rewritten, file_ctx, nature)
+    if category == "explanatory":
+        return generate_report(models, text, ctx)
+
+    plan = build_execution_plan(models, text, ctx)
     return execute_plan(plan)
 
 ########################################
-# Service Mode
+# Service mode
 ########################################
 def run_as_service():
-    logger.info("MCP 서비스가 가동되었습니다. (대기 모드)")
-    
-    stop_signal = False
-    def signal_handler(sig, frame):
-        nonlocal stop_signal
-        logger.info("종료 시그널 수신 중...")
-        stop_signal = True
+    logger.info("MCP 서비스 실행됨 (대기)")
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    stop = False
 
-    while not stop_signal:
+    def handler(sig, frame):
+        nonlocal stop
+        stop = True
+        logger.info("종료 요청 수신...")
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+    while not stop:
         time.sleep(1)
-    
-    logger.info("MCP 서비스가 안전하게 종료되었습니다.")
+
+    logger.info("MCP 서비스 종료 완료")
 
 ########################################
 # MAIN
@@ -380,20 +349,27 @@ def main():
     args = parser.parse_args()
 
     if args.cli:
-        print("=== MCP CLI Mode ===")
+        print("=== MCP CLI MODE ===")
         while True:
-            text = input("\nMCP> ").strip()
-            if text.lower() in ("quit", "exit"):
-                break
             try:
-                print(json.dumps(handle_input(text), indent=2, ensure_ascii=False))
+                line = input("\nMCP> ").strip()
+            except EOFError:
+                break
+
+            if line.lower() in ("quit", "exit"):
+                break
+
+            try:
+                res = handle_input(line)
+                print(json.dumps(res, ensure_ascii=False, indent=2))
             except Exception:
                 log_error(traceback.format_exc())
-                print("❌ error occurred")
+                print("❌ error")
+
     elif args.text:
         try:
-            result = handle_input(args.text)
-            print(json.dumps(result, ensure_ascii=False))
+            res = handle_input(args.text)
+            print(json.dumps(res, ensure_ascii=False))
         except Exception:
             log_error(traceback.format_exc())
             print(json.dumps({"error": "AI processing failed"}, ensure_ascii=False))
