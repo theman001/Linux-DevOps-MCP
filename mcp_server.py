@@ -68,7 +68,7 @@ MODEL_CHAINS = {
 CONFIDENCE_THRESHOLD = 0.6
 
 ########################################
-# Report mode trigger keywords
+# Triggers
 ########################################
 REPORT_KEYWORDS = [
     "report mode",
@@ -77,9 +77,6 @@ REPORT_KEYWORDS = [
     "[report]"
 ]
 
-########################################
-# Context trigger keywords
-########################################
 CONTEXT_TRIGGERS = [
     "이 폴더",
     "현재 폴더",
@@ -210,7 +207,7 @@ def classify_request(user_input: str, file_ctx=None) -> dict:
     }
 
     try:
-        progress("⏳ 요청 분류 중 (nemotron-3-nano)")
+        progress(f"[CLASSIFIER] {MODEL_CLASSIFIER} → 요청 분류중...")
         client = ollama_client()
         resp = client.chat(
             model=MODEL_CLASSIFIER,
@@ -244,7 +241,13 @@ def call_with_fallback(models, system_prompt, user_prompt, nature="unknown"):
         try:
             progress(f"[{nature.upper()}] {model} → 요청 처리중...")
             resp = client.chat(
-                ...
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(user_prompt)}
+                ],
+                format="json",
+                stream=False
             )
             return safe_load_json(resp["message"]["content"], {})
         except Exception as e:
@@ -252,7 +255,6 @@ def call_with_fallback(models, system_prompt, user_prompt, nature="unknown"):
             log_error(traceback.format_exc())
             progress(f"[{nature.upper()}] {model} → 실패: {last}")
     raise RuntimeError(last)
-
 
 ########################################
 # Execution plan builder
@@ -281,7 +283,8 @@ def execute_plan(plan):
             "description": plan.get("description", "No commands to execute")
         }
 
-    progress("⏳ 명령어 실행 중 (root)")
+    progress("[EXECUTE] root 권한으로 명령 실행중...")
+
     results = []
     for cmd in commands:
         proc = subprocess.run(
@@ -297,6 +300,8 @@ def execute_plan(plan):
             "stdout": proc.stdout.strip(),
             "stderr": proc.stderr.strip()
         })
+
+    progress("[EXECUTE] 완료")
 
     return {
         "mode": "EXECUTE",
@@ -314,7 +319,8 @@ def generate_report(models, rewritten_request, file_ctx, nature):
     res = call_with_fallback(
         models,
         system_prompt,
-        {"rewritten_request": rewritten_request, "project_context": file_ctx or {}}
+        {"rewritten_request": rewritten_request, "project_context": file_ctx or {}},
+        nature=nature
     )
     return {"mode": "REPORT", "report": res}
 
