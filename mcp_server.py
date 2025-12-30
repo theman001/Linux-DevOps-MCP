@@ -22,14 +22,23 @@ LOG_FILE = BASE_DIR / "error.log"
 ENV_FILE = "/etc/mcp.env"
 
 ########################################
-# Logging
+# Logging (UI 출력 최소화)
 ########################################
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+LOG_FILE = BASE_DIR / "error.log"
+
 logger = logging.getLogger("MCP")
+logger.setLevel(logging.INFO)
+
+# 🔹 UI로 출력되지 않는 File Logger
+file_handler = logging.FileHandler(LOG_FILE)
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(logging.Formatter(
+    '%(asctime)s [%(levelname)s] %(message)s'
+))
+
+# ❗ stdout handler 제거 = UI 로그 사라짐
+logger.handlers.clear()
+logger.addHandler(file_handler)
 
 ########################################
 # Models
@@ -98,7 +107,7 @@ def safe_json(text, default=None):
 # FRIENDLY PROGRESS PRINT
 ########################################
 def step(msg):
-    print(f"\n🔹 {msg}", flush=True)
+    print(f"\n🟦 [상태] {msg}", flush=True)
 
 
 ########################################
@@ -235,6 +244,8 @@ def execute(plan):
 # PRETTY PRINT
 ########################################
 def pretty_print(result):
+    print("\n🟩 ===== 최종 결과 =====")
+
     mode = result.get("mode")
 
     if mode == "EXECUTE":
@@ -253,16 +264,22 @@ def pretty_print(result):
             print("\n💾 저장 위치:", result["saved_to"])
 
     elif mode == "REPORT":
-        print("\n📘 기술 설명 보고서 생성 완료\n")
         rep = result["report"]
+
+        print("\n📘 기술 설명 보고서")
         print("📝 요약:", rep.get("summary"))
+
         print("\n📌 단계별 설명:")
         for s in rep.get("steps",[]):
             print(" -", s)
+
         print("\n⚠️ 위험도:", rep.get("risk"))
 
     else:
         print("\nℹ️", result.get("description","실행 없음"))
+
+    print("\n🟩 =====================\n")
+
 
 
 ########################################
