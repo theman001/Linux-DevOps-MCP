@@ -17,86 +17,52 @@ from ollama import Client
 # Paths
 ########################################
 BASE_DIR = Path(__file__).resolve().parent
+PROMPT_DIR = BASE_DIR / "prompts"
 LOG_FILE = BASE_DIR / "error.log"
 ENV_FILE = "/etc/mcp.env"
-
-PROMPT_DIR = BASE_DIR / "prompts"
-CLASSIFIER_FILE = PROMPT_DIR / "classifier.txt"
-PLANNER_FILE = PROMPT_DIR / "planner.txt"
-REPORTER_FILE = PROMPT_DIR / "reporter.txt"
 
 ########################################
 # Logging
 ########################################
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("MCP-Server")
+logger = logging.getLogger("MCP")
 
 ########################################
-# Model policy
+# Models
 ########################################
 MODEL_CLASSIFIER = "nemotron-3-nano:30b-cloud"
 
 MODEL_CHAINS = {
-    "server_operation": [
-        "gpt-oss:120b",
-        "qwen3-next:80b",
-    ],
-    "code_generation": [
-        "devstral-2:123b-cloud",
-        "qwen3-coder:480b-cloud",
-    ],
-    "explanatory": [
-        "gemini-3-flash-preview:cloud",
-        "mistral-large-3",
-    ],
-    "unknown": [
-        "ministral-3:14b",
-        "glm-4.6",
-    ],
+    "server_operation": ["gpt-oss:120b", "qwen3-next:80b"],
+    "code_generation": ["devstral-2:123b-cloud", "qwen3-coder:480b-cloud"],
+    "explanatory": ["gemini-3-flash-preview:cloud", "mistral-large-3"],
+    "unknown": ["ministral-3:14b", "glm-4.6"],
 }
 
 CONFIDENCE_THRESHOLD = 0.6
 
-########################################
-# Allowed file extensions for context
-########################################
-ALLOWED_EXT = (
-    ".py", ".sh", ".conf", ".yaml", ".yml",
-    ".json", ".ini", ".cfg", ".go", ".js", ".ts"
-)
 
 ########################################
-# Utilities
-########################################
-def log_error(msg):
-    LOG_FILE.parent.mkdir(exist_ok=True)
-    with open(LOG_FILE, "a") as f:
-        f.write(f"[{datetime.now()}] {msg}\n")
-
-def progress(msg):
-    print(msg, file=sys.stderr, flush=True)
-
-########################################
-# ENV loader
+# ENV LOAD
 ########################################
 def ensure_env_loaded():
     if os.environ.get("OLLAMA_API_KEY"):
         return
     if not os.path.exists(ENV_FILE):
         return
-
     with open(ENV_FILE) as f:
         for line in f:
             if "=" in line and not line.strip().startswith("#"):
                 k, v = line.strip().split("=", 1)
                 os.environ.setdefault(k, v.strip().strip('"').strip("'"))
 
+
 ########################################
-# Ollama client
+# OLLAMA CLIENT
 ########################################
 def ollama_client():
     return Client(
@@ -104,104 +70,49 @@ def ollama_client():
         headers={"Authorization": f"Bearer {os.environ.get('OLLAMA_API_KEY')}"}
     )
 
+
 ########################################
-# JSON safe loader
+# PROMPT LOADER
 ########################################
-def safe_load_json(text, default=None):
+def load_prompt(name):
+    path = PROMPT_DIR / name
     try:
-        clean = re.sub(r"```json\s*|\s*```", "", text).strip()
+        return path.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.error(f"❌ 프롬프트 로드 실패: {name} — {e}")
+        return ""
+
+
+########################################
+# SAFE JSON PARSE
+########################################
+def safe_json(text, default=None):
+    try:
+        clean = re.sub(r"```json|```", "", text).strip()
         return json.loads(clean)
     except Exception:
         return default
 
-########################################
-# Prompt loaders (hot reload)
-########################################
-def load_prompt(path: Path):
-    if not path.exists():
-        raise RuntimeError(f"Prompt not found: {path}")
-    return path.read_text()
 
 ########################################
-# Classifier
+# FRIENDLY PROGRESS PRINT
 ########################################
-def classify(user_input):
-    try:
-        system_prompt = load_prompt(CLASSIFIER_FILE)
-        client = ollama_client()
+def step(msg):
+    print(f"\n🔹 {msg}", flush=True)
 
-        progress("🔍 Classifier 호출 (nemotron-3-nano)")
-
-        resp = client.chat(
-            model=MODEL_CLASSIFIER,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_input}
-            ],
-            format="json",
-            stream=False
-        )
-
-        parsed = safe_load_json(resp["message"]["content"], {})
-
-        return {
-            "category": parsed.get("category", "unknown"),
-            "confidence": parsed.get("confidence", 0.0),
-            "needs_context": parsed.get("needs_context", False),
-            "reason": parsed.get("reason", "")
-        }
-
-    except Exception:
-        log_error(traceback.format_exc())
-        return {
-            "category": "unknown",
-            "confidence": 0.0,
-            "needs_context": False,
-            "reason": "classification failed"
-        }
 
 ########################################
-# Context loader
+# MODEL CALL WITH FALLBACK
 ########################################
-def load_project_context(max_per_file=60000, max_total=250000):
-    ctx = {}
-    total = 0
-
-    for path in BASE_DIR.glob("*"):
-        if not path.is_file():
-            continue
-        if path.suffix.lower() not in ALLOWED_EXT:
-            continue
-
-        try:
-            data = path.read_text(errors="ignore")
-            if len(data) > max_per_file:
-                data = data[:max_per_file] + "\n...[TRUNCATED]"
-
-            if total + len(data) > max_total:
-                break
-
-            ctx[path.name] = data
-            total += len(data)
-
-        except Exception:
-            continue
-
-    return ctx
-
-########################################
-# Model chain executor
-########################################
-def call_with_models(models, system_prompt, user_payload):
+def call_with_fallback(models, system_prompt, user_payload):
     client = ollama_client()
-    last = None
+    last_error = None
 
-    for model in models:
+    for m in models:
         try:
-            progress(f"🤖 모델 호출: {model}")
-
+            step(f"모델 호출: {m}")
             resp = client.chat(
-                model=model,
+                model=m,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
@@ -209,138 +120,207 @@ def call_with_models(models, system_prompt, user_payload):
                 format="json",
                 stream=False
             )
-
-            return safe_load_json(resp["message"]["content"], {})
-
+            return safe_json(resp["message"]["content"], {})
         except Exception as e:
-            last = str(e)
-            log_error(traceback.format_exc())
-            progress(f"⚠️ 실패: {model}: {last}")
+            last_error = str(e)
+            logger.error(traceback.format_exc())
+            step(f"⚠️ {m} 호출 실패 — 다음 모델로 대체 시도")
 
-    raise RuntimeError(last)
+    raise RuntimeError(last_error)
 
-########################################
-# Planner
-########################################
-def build_execution_plan(models, rewritten_request, ctx):
-    system_prompt = load_prompt(PLANNER_FILE)
-
-    payload = {
-        "rewritten_request": rewritten_request,
-        "project_context": ctx or {}
-    }
-
-    return call_with_models(models, system_prompt, payload)
 
 ########################################
-# Reporter
+# CLASSIFIER
 ########################################
-def generate_report(models, rewritten_request, ctx):
-    system_prompt = load_prompt(REPORTER_FILE)
+def classify(user_text):
+    step("요청 분류 중… (Classifier 호출)")
 
-    payload = {
-        "rewritten_request": rewritten_request,
-        "project_context": ctx or {}
-    }
+    system_prompt = load_prompt("classifier.txt")
 
-    res = call_with_models(models, system_prompt, payload)
+    client = ollama_client()
 
-    return {"mode": "REPORT", "report": res}
+    try:
+        resp = client.chat(
+            model=MODEL_CLASSIFIER,
+            messages=[
+                {"role":"system","content":system_prompt},
+                {"role":"user","content":user_text}
+            ],
+            format="json",
+            stream=False
+        )
+    except Exception as e:
+        print("❌ 분류 모델 호출 실패:", e)
+        return {"category":"unknown","confidence":0.0,"needs_context":False,"reason":"classifier error"}
+
+    result = safe_json(resp["message"]["content"], None)
+
+    if not result:
+        print("⚠️ Classifier 응답 JSON 파싱 실패 — unknown 처리")
+        return {"category":"unknown","confidence":0.0,"needs_context":False,"reason":"parse failed"}
+
+    return result
+
 
 ########################################
-# Executor
+# PLAN BUILDER
 ########################################
-def execute_plan(plan):
+def build_plan(category, rewritten, ctx):
+    system_prompt = load_prompt("planner.txt")
+    models = MODEL_CHAINS.get(category, MODEL_CHAINS["unknown"])
+
+    return call_with_fallback(
+        models,
+        system_prompt,
+        {"rewritten_request": rewritten, "context": ctx}
+    )
+
+
+########################################
+# REPORT
+########################################
+def build_report(category, rewritten, ctx):
+    system_prompt = load_prompt("reporter.txt")
+    models = MODEL_CHAINS.get(category, MODEL_CHAINS["unknown"])
+
+    return call_with_fallback(
+        models,
+        system_prompt,
+        {"rewritten_request": rewritten, "context": ctx}
+    )
+
+
+########################################
+# EXECUTION
+########################################
+def execute(plan):
     commands = plan.get("commands", [])
-    if not isinstance(commands, list):
-        commands = []
-
     if not commands:
-        return {
-            "mode": "NO_EXEC",
-            "description": plan.get("description", "No commands generated")
-        }
-
-    progress("🛠 명령 실행 중...")
+        return {"mode":"NO_EXEC","description":"실행할 명령이 없습니다."}
 
     results = []
+
+    step("명령 실행 중…")
+
     for cmd in commands:
         proc = subprocess.run(
             cmd,
             shell=True,
             capture_output=True,
-            text=True,
-            timeout=90
+            text=True
         )
 
-        results.append({
+        result = {
             "command": cmd,
             "returncode": proc.returncode,
             "stdout": proc.stdout.strip(),
-            "stderr": proc.stderr.strip(),
-        })
+            "stderr": proc.stderr.strip()
+        }
+
+        if proc.returncode != 0:
+            print(f"\n❌ 명령 실패: {cmd}")
+            print(f"stderr: {proc.stderr.strip()}")
+
+        results.append(result)
 
     return {
-        "mode": "EXECUTE",
-        "description": plan.get("description"),
-        "results": results,
-        "saved_to": plan.get("output_file")
+        "mode":"EXECUTE",
+        "description":plan.get("description"),
+        "results":results,
+        "saved_to":plan.get("output_file")
     }
 
+
 ########################################
-# Dispatcher
+# PRETTY PRINT
+########################################
+def pretty_print(result):
+    mode = result.get("mode")
+
+    if mode == "EXECUTE":
+        print("\n🛠 실행 완료")
+        print("📄 설명:", result.get("description","-"))
+
+        for r in result.get("results",[]):
+            print(f"\n🔹 {r['command']}")
+            print(f"➡️ 코드: {r['returncode']}")
+            if r['stdout']:
+                print(r['stdout'])
+            if r['stderr']:
+                print("⚠️", r['stderr'])
+
+        if result.get("saved_to"):
+            print("\n💾 저장 위치:", result["saved_to"])
+
+    elif mode == "REPORT":
+        print("\n📘 기술 설명 보고서 생성 완료\n")
+        rep = result["report"]
+        print("📝 요약:", rep.get("summary"))
+        print("\n📌 단계별 설명:")
+        for s in rep.get("steps",[]):
+            print(" -", s)
+        print("\n⚠️ 위험도:", rep.get("risk"))
+
+    else:
+        print("\nℹ️", result.get("description","실행 없음"))
+
+
+########################################
+# HANDLE USER INPUT
 ########################################
 def handle_input(text):
+
     cls = classify(text)
 
-    category = cls["category"]
-    confidence = cls["confidence"]
-    needs_ctx = cls["needs_context"]
+    category = cls.get("category","unknown")
+    conf = cls.get("confidence",0.0)
 
-    if confidence < CONFIDENCE_THRESHOLD:
+    print(f"\n📌 분류 결과 — category={category}, confidence={conf}")
+
+    if conf < CONFIDENCE_THRESHOLD:
         category = "unknown"
 
-    models = MODEL_CHAINS.get(category, MODEL_CHAINS["unknown"])
+    # context load는 이후 추가 가능 (지금은 빈 dict)
+    ctx = {}
 
-    progress(f"📌 category={category}, needs_context={needs_ctx}")
-
-    ctx = load_project_context() if needs_ctx else {}
+    rewritten = text
 
     if category == "explanatory":
-        return generate_report(models, text, ctx)
+        rep = build_report(category, rewritten, ctx)
+        pretty_print({"mode":"REPORT","report":rep})
+    else:
+        plan = build_plan(category, rewritten, ctx)
+        if not isinstance(plan,dict) or "commands" not in plan:
+            print("\n⚠️ 실행계획 JSON 구조 오류")
+            return
+        res = execute(plan)
+        pretty_print(res)
 
-    plan = build_execution_plan(models, text, ctx)
-    return execute_plan(plan)
 
 ########################################
-# Service mode
+# SERVICE LOOP
 ########################################
 def run_as_service():
-    logger.info("MCP 서비스 실행됨 (대기)")
-
+    logger.info("MCP Service Running…")
     stop = False
 
-    def handler(sig, frame):
+    def sig(_sig,_frm):
         nonlocal stop
         stop = True
-        logger.info("종료 요청 수신...")
 
-    signal.signal(signal.SIGINT, handler)
-    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT,sig)
+    signal.signal(signal.SIGTERM,sig)
 
     while not stop:
         time.sleep(1)
 
-    logger.info("MCP 서비스 종료 완료")
+    logger.info("MCP Service Exit")
+
 
 ########################################
 # MAIN
 ########################################
 def main():
-    if os.geteuid() != 0:
-        print("❌ must run as root", file=sys.stderr)
-        return
-
     ensure_env_loaded()
 
     parser = argparse.ArgumentParser()
@@ -351,30 +331,25 @@ def main():
     if args.cli:
         print("=== MCP CLI MODE ===")
         while True:
-            try:
-                line = input("\nMCP> ").strip()
-            except EOFError:
+            text = input("\nMCP> ").strip()
+            if text in ("quit","exit"):
                 break
-
-            if line.lower() in ("quit", "exit"):
-                break
-
             try:
-                res = handle_input(line)
-                print(json.dumps(res, ensure_ascii=False, indent=2))
+                handle_input(text)
             except Exception:
-                log_error(traceback.format_exc())
-                print("❌ error")
+                logger.error(traceback.format_exc())
+                print("\n❌ 내부 오류 발생")
 
     elif args.text:
         try:
-            res = handle_input(args.text)
-            print(json.dumps(res, ensure_ascii=False))
+            handle_input(args.text)
         except Exception:
-            log_error(traceback.format_exc())
-            print(json.dumps({"error": "AI processing failed"}, ensure_ascii=False))
+            logger.error(traceback.format_exc())
+            print("\n❌ 처리 실패")
+
     else:
         run_as_service()
+
 
 if __name__ == "__main__":
     main()
