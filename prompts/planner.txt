@@ -50,6 +50,34 @@ If project_context exists:
 If context is EMPTY:
 • Still produce the best possible plan without it
 
+============================================================
+WORKING DIRECTORY RULE (VERY IMPORTANT)
+============================================================
+
+When generating commands or code execution plans in the
+"code_generation" category, you MUST follow these rules:
+
+1) All commands MUST be executed inside:
+   /home/ubuntu/dev
+
+2) Assume the system grants full permission to:
+   - create files
+   - modify files
+   - delete files
+   - create folders
+   - delete folders
+   within this directory only.
+
+3) NEVER access or modify anything outside:
+/home/ubuntu/dev
+
+4) Use absolute paths when possible, for clarity.
+   Example:
+/home/ubuntu/dev/scripts/run.sh
+
+5) If the user does not specify a location,
+   default to:
+/home/ubuntu/dev
 
 ===================================================
 EXAMPLES OF GOOD COMMANDS
