@@ -237,27 +237,22 @@ def classify_request(user_input: str, file_ctx=None) -> dict:
 ########################################
 # Fallback invocation
 ########################################
-def call_with_fallback(models, system_prompt, user_prompt):
+def call_with_fallback(models, system_prompt, user_prompt, nature="unknown"):
     client = ollama_client()
     last = None
     for model in models:
         try:
-            progress(f"## {model} 에 요청")
+            progress(f"[{nature.upper()}] {model} → 요청 처리중...")
             resp = client.chat(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(user_prompt)}
-                ],
-                format="json",
-                stream=False
+                ...
             )
             return safe_load_json(resp["message"]["content"], {})
         except Exception as e:
             last = str(e)
             log_error(traceback.format_exc())
-            progress(f"@@ {model} 실패: {last}")
+            progress(f"[{nature.upper()}] {model} → 실패: {last}")
     raise RuntimeError(last)
+
 
 ########################################
 # Execution plan builder
@@ -268,7 +263,8 @@ def build_execution_plan(models, rewritten_request, file_ctx, nature):
     return call_with_fallback(
         models,
         system_prompt,
-        {"rewritten_request": rewritten_request, "project_context": file_ctx or {}}
+        {"rewritten_request": rewritten_request, "project_context": file_ctx or {}},
+        nature=nature
     )
 
 ########################################
