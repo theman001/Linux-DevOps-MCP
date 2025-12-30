@@ -86,37 +86,96 @@ even if the code will run on a server.
 
 3) "explanatory"
 
-Choose this when the goal is KNOWLEDGE, UNDERSTANDING,
-OR CONCEPTUAL EXPLANATION — NOT execution or coding.
+Choose this when the user's PRIMARY goal is to
+UNDERSTAND a concept, tool, command, log message,
+architecture, or theory — NOT to execute operations
+and NOT to write code.
 
-Examples:
-- Explaining how tools work
-- Explaining commands
-- Theory / concepts / best practices
-- Architecture explanation
+This category is for knowledge, learning, reasoning,
+clarification and explanation-based requests.
 
-Typical user inputs:
-- "systemctl이 뭐야?"
+Typical examples:
+- Explaining how a system works
+- Explaining a command or CLI behavior
+- Meaning of error messages
+- Best practices and theory
+- Architecture or workflow explanation
+- Guidelines or conceptual design discussions
+- Impact or risk explanation
+- Troubleshooting methodology (not execution)
+
+Example user inputs:
+- "systemctl이 뭐하는 명령이야?"
 - "reverse proxy 구조 설명해줘"
+- "kubernetes가 왜 필요한거야?"
 - "이 에러 메시지 의미가 뭐야?"
-- "쿠버네티스가 뭐야?"
+- "이 시스템 구조를 쉽게 설명해줘"
+- "TLS랑 SSL 차이가 뭐야?"
+- "해당 옵션을 켜면 어떤 영향이 있어?"
+
+Also use explanatory when:
+- The user is asking for high-level guidance
+- The answer does not require running commands
+- The focus is on WHY and HOW, not DOING
+- Logs are being interpreted conceptually
+
+Borderline rule:
+If the user only wants to *understand* a command → explanatory  
+If the user wants to *run* a command → server_operation  
+If the user wants *new code* → code_generation
+
+Examples that SHOULD NOT be explanatory:
+- “nginx 재시작해줘”
+- “python 코드 작성해줘”
+- “이 설정으로 파일 만들어줘”
 
 ------------------------------------------------------------
 
 4) "unknown"
 
-Use this when:
-- The request is unclear
-- Intent cannot be determined
-- The text is incomplete
-- It is casual conversation
-- It is unrelated to systems or code
+Use this category when the intent is unclear,
+irrelevant, incomplete, ambiguous, casual,
+or unrelated to technical work.
 
-Examples:
+Choose "unknown" when:
+- The request lacks enough detail to classify
+- The meaning cannot be reasonably inferred
+- The message is conversational or emotional
+- The topic is unrelated to Linux/DevOps/code
+- The user gave vague instructions without context
+- The request appears random or non-technical
+- The sentence is fragmentary or missing information
+
+Example user inputs:
 - "이거 해줘"
-- "뭐하지?"
-- "ㅋㅋㅋㅋㅋㅋ"
-- "사진 봐줘"
+- "좀 도와줘"
+- "뭐가 문제인지 모르겠어"
+- "ㅋㅋㅋㅋㅋ"
+- "사진 좀 봐줘"
+- "이건 왜이래?"
+- "??"
+- "대충 알아서 해줘"
+
+Also use unknown when:
+- Multiple categories appear equally likely
+- The user gives technical keywords but no intent
+- The action cannot be safely assumed
+- The text resembles small-talk
+
+If you choose unknown:
+Set confidence low (e.g. 0.2 ~ 0.4)
+
+-----------------------------------------------
+DO NOT incorrectly classify these as unknown:
+-----------------------------------------------
+
+NOT unknown when:
+- The user clearly asks to run commands → server_operation
+- The user clearly wants code → code_generation
+- The user clearly wants explanation → explanatory
+
+Only use unknown when the core intent itself
+cannot be reliably determined.
 
 ------------------------------------------------------------
 CONTEXT REQUIREMENT DECISION
